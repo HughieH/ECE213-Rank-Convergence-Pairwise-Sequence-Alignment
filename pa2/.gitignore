@@ -1,0 +1,14 @@
+/build/
+/results/
+/data/
+*.o
+*.a
+*.so
+*.d
+*.o.d
+*.bin
+*.log
+*.sqlite
+*.nsys-rep
+*.csv
+*.xz
