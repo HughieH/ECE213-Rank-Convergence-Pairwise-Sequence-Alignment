@@ -1,0 +1,504 @@
+#include "alignment.cuh"
+#include <stdio.h>
+#include <cstring>
+#include <algorithm>
+#include <fstream>
+#include <tbb/parallel_for.h>
+
+/**
+ * Allocates GPU memory for sequences, lengths, and traceback paths.
+ * Calculates 'longestLen' to determine the stride for flattening the sequence array.
+ */
+void GpuAligner::allocateMem() {
+    // 1. Find the maximum sequence length to determine memory stride
+    longestLen = std::max_element(seqs.begin(), seqs.end(), [](const Sequence& a, const Sequence& b) {
+        return a.seq.size() < b.seq.size();
+    })->seq.size();
+
+    cudaError_t err;
+    
+    // 2. Allocate flat array for all sequences (Reference + Query pairs)
+    // Layout: [Seq0_Ref ...pad... | Seq0_Qry ...pad... | Seq1_Ref ... ]
+    err = cudaMalloc(&d_seqs, numPairs * 2 * longestLen * sizeof(char));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 3. Allocate array for sequence lengths (to handle padding correctly)
+    err = cudaMalloc(&d_seqLen, numPairs * 2 * sizeof(int32_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 4. Allocate Traceback Buffer
+    // Worst case path is roughly 2x sequence length (all gaps)
+    int tb_length = longestLen << 1; 
+    err = cudaMalloc(&d_tb, numPairs * tb_length * sizeof(uint8_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 5. Allocate meta-info struct (numPairs, maxLen)
+    err = cudaMalloc(&d_info, 2 * sizeof(int32_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+}
+
+/**
+ * Flattens the host sequence objects into a single 1D array and transfers to GPU.
+ */
+void GpuAligner::transferSequence2Device() {
+    cudaError_t err;
+    
+    // 1. Flatten sequences on Host
+    // We use a fixed stride 'longestLen' to simplify indexing on the GPU
+    std::vector<char> h_seqs(longestLen * numPairs * 2, 0); 
+    
+    for (size_t i = 0; i < numPairs * 2; ++i) {
+        const std::string& s = seqs[i].seq;
+        std::memcpy(h_seqs.data() + (i * longestLen), s.data(), s.size());
+    }
+
+    // 2. Transfer flattened sequences to Device
+    err = cudaMemcpy(d_seqs, h_seqs.data(), longestLen * numPairs * 2 * sizeof(char), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 3. Transfer sequence lengths to Device
+    std::vector<int32_t> h_seqLen(numPairs * 2, 0);
+    for (int i = 0; i < numPairs * 2; ++i) h_seqLen[i] = seqs[i].seq.size();
+    
+    err = cudaMemcpy(d_seqLen, h_seqLen.data(), numPairs * 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 4. Initialize Traceback buffer on Device (Zero out)
+    int tb_length = longestLen << 1;
+    std::vector<uint8_t> h_tb (tb_length * numPairs, 0);
+    
+    err = cudaMemcpy(d_tb, h_tb.data(), tb_length * numPairs * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    // 5. Transfer Meta Info
+    std::vector<int32_t> h_info (2);
+    h_info[0] = numPairs;
+    h_info[1] = longestLen;
+    err = cudaMemcpy(d_info, h_info.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+}
+
+/**
+ * Copies the computed traceback paths from GPU back to Host.
+ */
+TB_PATH GpuAligner::transferTB2Host() {
+    int tb_length = longestLen << 1;
+    TB_PATH h_tb(tb_length * numPairs);
+
+    cudaError_t err = cudaMemcpy(h_tb.data(), d_tb, tb_length * numPairs * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+    return h_tb;
+}
+
+/**
+ * CUDA Kernel: Performs tiled alignment (GACT) on the GPU.
+ * TODO: Optimize using shared memory, wavefront parallelism, and memory coalescing.
+ * HINT: 
+ * Consider
+ * 1. Number of threads for each step (initialization, filling scoring matrix, traceback)
+ * 2. Which variables should go in registers vs shared memory
+ * 3. Where should __syncthreads() be added?
+ * 4. TODOs marked below are the main tasks, but other parts may also need changes for correctness or efficiency
+ * 5. You may add/modify shared memory, registers, or helper functions as needed, as long as output is valid
+ */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#include <cuda/ptx>
+#endif
+
+__device__ __forceinline__ void max_score(
+    int16_t score_diag, int16_t score_up, int16_t score_left, int16_t &score_out,
+    uint8_t &dir_out, uint8_t DIR_DIAG, uint8_t DIR_UP, uint8_t DIR_LEFT
+) {
+// have to add __CUDA_ARCH__ >= 900 to avoind compilation error on A30
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)    
+    uint32_t du = score_diag | (score_up << 16);
+
+    // put UP into lane0 (also lane1, but lane1 doesn't matter)
+    uint32_t c  = score_up | (score_up<< 16);
+
+    // lane0: max(diag,up), lane1: max(up,up)=up
+    int32_t out = __viaddmax_s16x2(0, du, c);
+
+    int16_t best = out & 0xFFFF;
+    // dir for diag vs up
+    uint8_t dir = (score_up > score_diag) ? DIR_UP : DIR_DIAG;
+
+    if (score_left > best) {
+        best = score_left;
+        dir = DIR_LEFT;
+    }
+    score_out = best;
+    dir_out = dir;
+
+#else // smae as the original code
+    score_out = score_diag;
+    dir_out = DIR_DIAG;
+    if (score_up > score_out) {
+        score_out = score_up;
+        dir_out = DIR_UP;
+    }
+    if (score_left > score_out) {
+        score_out = score_left;
+        dir_out = DIR_LEFT;
+    }
+#endif
+}
+
+// ============================================================
+// full NW global alignment
+//
+// What changed vs HW kernel:
+//   1. Removed GACT tile loop — single pass over all M+N diagonals.
+//   2. Removed overlap/maxScore/best_ti/best_tj logic (GACT-specific).
+//   3. tbDir now covers the full M*N table (not T*T tile).
+//      Because M*N can be large, tbDir lives in global memory (d_tbDir),
+//      not shared memory. shared memory retains wf_scores + ref/qry.
+//   4. Base cases (i==0 or j==0) use the exact NW formula: -k*GAP.
+//   5. Traceback walks from (M,N) to (0,0) over the full tbDir table.
+//
+// UNCHANGED vs HW kernel:
+//   - 3-wavefront cyclic buffer pattern (wf_scores[3*(maxLen+1)])
+//   - Wavefront parallel loop: i = i_start + tx; i <= i_end; i += blockDim.x
+//   - __syncthreads() after each diagonal
+//   - max_score() DPX helper
+//   - shared_ref / shared_qry loaded via coalesced strided loop
+//   - One block per alignment pair (blockIdx.x = pair)
+//   - Traceback written to d_tb with in-place reversal
+// ============================================================
+
+__global__ void alignmentOnGPU (
+    int32_t* d_info,       // [0]: numPairs, [1]: maxSeqLen
+    int32_t* d_seqLen,     // Array of sequence lengths
+    char* d_seqs,          // Flat array of sequences
+    uint8_t* d_tb          // Output traceback paths
+    uint8_t* d_tbDir       // full N*M direction table, global mem
+                           // size: numPairs * maxSeqLen * maxSeqLen
+) {
+    // -----------------------------------------------------------
+    // KERNEL CONFIGURATION
+    // -----------------------------------------------------------
+    int bx = blockIdx.x;
+    int tx = threadIdx.x;
+    
+    // Scoring Scheme (DO NOT MODIFY)
+    const int16_t MATCH = 2;
+    const int16_t MISMATCH = -1;
+    const int16_t GAP = -2;
+
+    // Traceback Direction Constants (DO NOT MODIFY)
+    const uint8_t DIR_DIAG = 1;
+    const uint8_t DIR_UP   = 2;
+    const uint8_t DIR_LEFT = 3;
+
+    int32_t numPairs  = d_info[0];
+    int32_t maxSeqLen = d_info[1];
+
+    int pair = bx;
+    if (pair >= numPairs) return;
+
+    // Calculate memory offsets for this pair
+    int32_t refStart = (pair * 2) * maxSeqLen;
+    int32_t qryStart = (pair * 2 + 1) * maxSeqLen;
+
+    int32_t DP_STRIDE = maxSeqLen + 1;
+    int32_t tbDirOffset = pair * DP_STRIDE * DP_STRIDE;  // full table
+
+    int32_t tb_stride = (maxSeqLen * 2 + 2);
+    int32_t tbGlobalOffset = pair * tb_stride; 
+
+    int32_t M = d_seqLen[2 * pair];      // ref len
+    int32_t N = d_seqLen[2 * pair + 1];  // qry len
+    if (M > maxSeqLen || N > maxSeqLen) return;
+
+    // ---------------------------------------------------
+    // Shared memory
+    // ---------------------------------------------------
+    extern __shared__ char smem[];
+    int16_t* wf_scores  = (int16_t*)smem;                          // 3*(M+1) int16
+    char* shared_ref = (char*)(wf_scores + 3 * DP_STRIDE);     // M chars
+    char* shared_qry = shared_ref + maxSeqLen;                     // N chars
+
+    // Load the reference and query segments from global memory into shared memory
+    // HINT: Using memory coalescing
+    for (int i = tx; i < M; i += blockDim.x) shared_ref[i] = d_seqs[refStart + i];
+    for (int j = tx; j < N; j += blockDim.x) shared_qry[j] = d_seqs[qryStart + j];
+    __syncthreads();
+
+    for (int idx = tx; idx < 3 * DP_STRIDE; idx += blockDim.x) {
+        wf_scores[idx] = -9999;
+    }
+    __syncthreads();
+
+    // -------------------------------------------------------
+    // Single diagonal loop over all M+N diagonals
+    // -------------------------------------------------------
+    for (int k = 0; k <= M + N; ++k) {
+
+        // Cyclic buffers for 3-wavefront dependency
+        int curr_k   = (k % 3) * (maxSeqLen + 1);
+        int pre_k    = ((k + 2) % 3) * (maxSeqLen + 1);
+        int prepre_k = ((k + 1) % 3) * (maxSeqLen + 1);
+
+        // TODO: should we clear current diagonal buffer?
+        for (int idx = tx; idx < DP_STRIDE; idx += blockDim.x) {
+            wf_scores[curr_k + idx] = NEG_INF;
+        }
+        __syncthreads();
+
+        // Compute loop bounds for this diagonal
+        int i_start = max(0, k - N);
+        int i_end   = min(M, k);
+
+        // Wavefront parallelism
+        for (int i = i_start + tx; i <= i_end; i += blockDim.x) {
+            int j = k - i;
+
+            int16_t score = -9999;
+            uint8_t direction = DIR_DIAG;
+
+            // -- Boundary Conditions --
+            if (i == 0 && j == 0) {
+                score = 0;
+                // no direction needed for origin
+            }
+            else if (i == 0) {
+                // NW base case: top row = LEFT gaps
+                score = j * GAP;
+                direction = DIR_LEFT;
+            }
+            else if (j == 0) {
+                // NW base case: left col = UP gaps
+                score = i * GAP;
+                direction = DIR_UP;
+            }
+            else {
+                // -- Inner Matrix Calculation --
+                char r_char = shared_ref[i - 1];
+                char q_char = shared_qry[j - 1];
+                            
+                int16_t score_diag = wf_scores[prepre_k + (i - 1)] + (r_char == q_char ? MATCH : MISMATCH);
+                int16_t score_up   = wf_scores[pre_k + (i - 1)] + GAP;
+                int16_t score_left = wf_scores[pre_k + i] + GAP;
+
+                max_score(score_diag, score_up, score_left, score, direction, DIR_DIAG, DIR_UP, DIR_LEFT);
+            }
+
+            // Write Score
+            wf_scores[curr_k + i] = score;
+
+            // Write Direction to global tbDir table (not shared T*T)
+            if (i > 0 || j > 0) {   // skip (0,0)
+                d_tbDir[tbDirOffset + i * maxSeqLen + j] = direction;
+            }
+        }
+        __syncthreads();  // barrier between diagonals
+    } // End Wavefront Loop
+
+    // ---------------------------------------------------
+    // TRACEBACK & REVERSAL
+    //  walks full (M,N)->(0,0) path in global tbDir
+    // ---------------------------------------------------
+    if (tx == 0) {
+        int localLen = 0;
+
+        int ti = M, tj = N;
+        while (ti > 0 || tj > 0 && localLen < tb_stride - 1) {
+            uint8_t dir;
+            // Implicit boundary handling for top/left edges
+            if (ti == 0) { 
+                dir = DIR_LEFT; 
+            } else if (tj == 0) { 
+                dir = DIR_UP;   
+            } else {
+                // Fetch direction from DP table
+                dir = d_tbDir[tbDirOffset + ti * maxSeqLen + tj];
+            }
+
+            // write in reverse order first
+            d_tb[tbGlobalOffset + localLen] = dir;
+            localLen++;
+
+            // Move coordinates
+            if (dir == DIR_DIAG) { ti--; tj--; } 
+            else if (dir == DIR_UP) { ti--; } 
+            else { tj--; }
+        }
+
+        // reverse in-place
+        for (int lo = 0, hi = localLen - 1; lo < hi; lo++, hi--) {
+            uint8_t tmp = d_tb[tbGlobalOffset + lo];
+            d_tb[tbGlobalOffset + lo] = d_tb[tbGlobalOffset + hi];
+            d_tb[tbGlobalOffset + hi] = tmp;
+        }
+    }
+    d_tb[tbGlobalOffset + localLen] = 0;
+}
+
+
+// Changes:
+//   1. Allocate d_tbDir (full direction table, global mem)
+//   2. Pass dynamic shared memory size (wf_scores + ref + qry)
+//   3. Pass d_tbDir to kernel
+//   4. Free d_tbDir after use
+
+void GpuAligner::alignment() {
+
+    // TODO: make sure to appropriately set the values below
+    int numBlocks = numPairs;  // i.e. number of thread blocks on the GPU
+    int blockSize = 256; // i.e. number of GPU threads per thread block
+
+    // 1. Allocate memory on Device
+    allocateMem();
+    
+    // 2. Transfer sequence to device
+    transferSequence2Device();
+
+    // 3. Allocate full direction table in global memory
+    // size = numPairs * maxLen * maxLen  (maxLen is known after allocateMem)
+    uint8_t* d_tbDir = nullptr;
+    cudaError_t err = cudaMalloc(&d_tbDir, numPairs * longestLen * longestLen * sizeof(uint8_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    cudaMemset(d_tbDir, 0, numPairs * longestLen * longestLen * sizeof(uint8_t));
+
+    // dynamic shared memory = wf_scores + shared_ref + shared_qry
+    size_t smem_bytes = 3 * (longestLen + 1) * sizeof(int16_t)
+                      + 2 * longestLen * sizeof(char);
+
+    // 4. Perform the alignment on GPU
+    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+    
+    // 5. Transfer the traceback path from device
+    TB_PATH tb_paths = transferTB2Host();
+    cudaDeviceSynchronize();
+    
+    // 6. Get the aligned sequence with traceback paths
+    getAlignedSequences(tb_paths);
+
+    // 7. Free direction table
+    cudaFree(d_tbDir);
+}
+
+
+//  ==== the following functions are the same as hw ====
+
+/** * Reconstructs the actual string alignment from the traceback paths (CIGAR-like data).
+ * Converts directional codes (DIAG, UP, LEFT) into aligned strings with gaps.
+ */
+void GpuAligner::getAlignedSequences (TB_PATH& tb_paths) {
+
+    const uint8_t DIR_DIAG = 1;
+    const uint8_t DIR_UP   = 2;
+    const uint8_t DIR_LEFT = 3;
+    
+    int tb_length = longestLen << 1;
+    
+    // TODO: Apply parallelism to this for loop
+    // HINT: Remember to add the header
+    tbb::parallel_for(0, numPairs, 1, [&] (int pair) {
+        int tb_start = tb_length * pair;
+        
+        int seqId0 = 2 * pair;
+        int seqId1 = 2 * pair + 1;
+        std::string& seq0 = seqs[seqId0].seq;
+        std::string& seq1 = seqs[seqId1].seq;
+        std::string aln0 = "";
+        std::string aln1 = "";
+        int seqPos0 = 0;
+        int seqPos1 = 0;
+
+        // Iterate through the recorded path directions
+        for (int i = tb_start; i < tb_start+tb_length; ++i) {
+            if (tb_paths[i] == DIR_DIAG) {
+                // Match/Mismatch
+                aln0 += seq0[seqPos0];
+                aln1 += seq1[seqPos1];
+                seqPos0++; seqPos1++;
+            }
+            else if (tb_paths[i] == DIR_UP) {
+                // Deletions (gap on seq1)
+                aln0 += seq0[seqPos0];
+                aln1 += '-';
+                seqPos0++;
+            }
+            else if (tb_paths[i] == DIR_LEFT) {
+                // Insertions (gap on seq0)
+                aln0 += '-';
+                aln1 += seq1[seqPos1];
+                seqPos1++;
+            }
+            else {
+                // End of the tb_path (encountered 0 or uninitialized value)
+                break;
+            }
+        }
+
+        // Save results
+        seqs[seqId0].aln = std::move(aln0);
+        seqs[seqId1].aln = std::move(aln1);
+    });
+}
+
+void GpuAligner::clearAndReset () {
+    cudaFree(d_seqs);
+    cudaFree(d_seqLen);
+    cudaFree(d_tb);
+    seqs.clear();
+    longestLen = 0;
+    numPairs = 0;
+}
+
+/**
+ * Writes the aligned sequences to a file in FASTA format.
+ * Each sequence is written with a header line ('>' + name) followed by the aligned sequence.
+ * If `append` is true, the output is appended to the file; otherwise, the file is overwritten.
+ */
+void GpuAligner::writeAlignment(std::string fileName, bool append) {
+    std::ofstream outFile;
+    if (append) outFile.open(fileName, std::ios::app);
+    else        outFile.open(fileName);
+    if (!outFile) {
+        fprintf(stderr, "ERROR: cant open file: %s\n", fileName.c_str());
+        exit(1);
+    }
+    for (auto& seq: seqs) {
+        outFile << ('>' + seq.name + '\n');
+        outFile << (seq.aln + '\n');
+    }
+    outFile.close();
+}
