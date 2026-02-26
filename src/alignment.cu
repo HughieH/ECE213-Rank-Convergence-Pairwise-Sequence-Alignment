@@ -34,15 +34,15 @@ void GpuAligner::allocateMem() {
 
     // 4. Allocate Traceback Buffer
     // Worst case path is roughly 2x sequence length (all gaps)
-    int tb_length = longestLen << 1; 
+    int tb_length = longestLen * 2 + 2; 
     err = cudaMalloc(&d_tb, numPairs * tb_length * sizeof(uint8_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
     }
 
-    // 5. Allocate meta-info struct (numPairs, maxLen)
-    err = cudaMalloc(&d_info, 2 * sizeof(int32_t));
+    // 5. Allocate wf_scores Buffer
+    err = cudaMalloc(&d_wf, numPairs * longestLen * sizeof(float));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -82,7 +82,7 @@ void GpuAligner::transferSequence2Device() {
     }
 
     // 4. Initialize Traceback buffer on Device (Zero out)
-    int tb_length = longestLen << 1;
+    int tb_length = longestLen * 2 + 2;
     std::vector<uint8_t> h_tb (tb_length * numPairs, 0);
     
     err = cudaMemcpy(d_tb, h_tb.data(), tb_length * numPairs * sizeof(uint8_t), cudaMemcpyHostToDevice);
@@ -106,7 +106,7 @@ void GpuAligner::transferSequence2Device() {
  * Copies the computed traceback paths from GPU back to Host.
  */
 TB_PATH GpuAligner::transferTB2Host() {
-    int tb_length = longestLen << 1;
+    int tb_length = longestLen * 2 + 2;
     TB_PATH h_tb(tb_length * numPairs);
 
     cudaError_t err = cudaMemcpy(h_tb.data(), d_tb, tb_length * numPairs * sizeof(uint8_t), cudaMemcpyDeviceToHost);
@@ -426,7 +426,7 @@ void GpuAligner::getAlignedSequences (TB_PATH& tb_paths) {
     const uint8_t DIR_UP   = 2;
     const uint8_t DIR_LEFT = 3;
     
-    int tb_length = longestLen << 1;
+    int tb_length = longestLen * 2 + 2;
     
     // TODO: Apply parallelism to this for loop
     // HINT: Remember to add the header
