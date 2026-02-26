@@ -171,33 +171,20 @@ __device__ __forceinline__ void max_score(
 #endif
 }
 
-// ============================================================
-// full NW global alignment
-//
-// What changed vs HW kernel:
-//   1. Removed GACT tile loop — single pass over all M+N diagonals.
-//   2. Removed overlap/maxScore/best_ti/best_tj logic (GACT-specific).
-//   3. tbDir now covers the full M*N table (not T*T tile).
-//      Because M*N can be large, tbDir lives in global memory (d_tbDir),
-//      not shared memory. shared memory retains wf_scores + ref/qry.
-//   4. Base cases (i==0 or j==0) use the exact NW formula: -k*GAP.
-//   5. Traceback walks from (M,N) to (0,0) over the full tbDir table.
-//
-// UNCHANGED vs HW kernel:
-//   - 3-wavefront cyclic buffer pattern (wf_scores[3*(maxLen+1)])
-//   - Wavefront parallel loop: i = i_start + tx; i <= i_end; i += blockDim.x
-//   - __syncthreads() after each diagonal
-//   - max_score() DPX helper
-//   - shared_ref / shared_qry loaded via coalesced strided loop
-//   - One block per alignment pair (blockIdx.x = pair)
-//   - Traceback written to d_tb with in-place reversal
-// ============================================================
 
+/**
+ * CUDA Kernel: Full NW global alignment on the GPU.
+// 1. Removed GACT tile loop
+// 2. Removed overlap/maxScore/best_ti/best_tj logic
+// 3. tbDir now covers the full M*N table (not T*T tile)
+//      Because M*N can be large, tbDir lives in global memory (d_tbDir),
+// 4. Traceback walks from (M,N) to (0,0) over the full tbDir table
+*/
 __global__ void alignmentOnGPU (
     int32_t* d_info,       // [0]: numPairs, [1]: maxSeqLen
     int32_t* d_seqLen,     // Array of sequence lengths
     char* d_seqs,          // Flat array of sequences
-    uint8_t* d_tb          // Output traceback paths
+    uint8_t* d_tb,          // Output traceback paths
     uint8_t* d_tbDir       // full N*M direction table, global mem
                            // size: numPairs * maxSeqLen * maxSeqLen
 ) {
@@ -268,7 +255,7 @@ __global__ void alignmentOnGPU (
 
         // TODO: should we clear current diagonal buffer?
         for (int idx = tx; idx < DP_STRIDE; idx += blockDim.x) {
-            wf_scores[curr_k + idx] = NEG_INF;
+            wf_scores[curr_k + idx] = -9999;
         }
         __syncthreads();
 
@@ -315,7 +302,7 @@ __global__ void alignmentOnGPU (
 
             // Write Direction to global tbDir table (not shared T*T)
             if (i > 0 || j > 0) {   // skip (0,0)
-                d_tbDir[tbDirOffset + i * maxSeqLen + j] = direction;
+                d_tbDir[tbDirOffset + i * DP_STRIDE + j] = direction;
             }
         }
         __syncthreads();  // barrier between diagonals
@@ -329,7 +316,7 @@ __global__ void alignmentOnGPU (
         int localLen = 0;
 
         int ti = M, tj = N;
-        while (ti > 0 || tj > 0 && localLen < tb_stride - 1) {
+        while ((ti > 0 || tj > 0) && localLen < tb_stride - 1) {
             uint8_t dir;
             // Implicit boundary handling for top/left edges
             if (ti == 0) { 
@@ -357,16 +344,16 @@ __global__ void alignmentOnGPU (
             d_tb[tbGlobalOffset + lo] = d_tb[tbGlobalOffset + hi];
             d_tb[tbGlobalOffset + hi] = tmp;
         }
+        d_tb[tbGlobalOffset + localLen] = 0;
     }
-    d_tb[tbGlobalOffset + localLen] = 0;
+    
 }
 
 
-// Changes:
-//   1. Allocate d_tbDir (full direction table, global mem)
-//   2. Pass dynamic shared memory size (wf_scores + ref + qry)
-//   3. Pass d_tbDir to kernel
-//   4. Free d_tbDir after use
+// 1. Allocate d_tbDir (full direction table, global mem)
+// 2. Pass dynamic shared memory size (wf_scores + ref + qry)
+// 3. Pass d_tbDir to kernel
+// 4. Free d_tbDir after use
 
 void GpuAligner::alignment() {
 
@@ -415,7 +402,7 @@ void GpuAligner::alignment() {
 }
 
 
-//  ==== the following functions are the same as hw ====
+//  The following functions are the same as hw
 
 /** * Reconstructs the actual string alignment from the traceback paths (CIGAR-like data).
  * Converts directional codes (DIAG, UP, LEFT) into aligned strings with gaps.

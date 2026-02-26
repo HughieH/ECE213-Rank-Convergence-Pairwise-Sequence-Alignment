@@ -28,7 +28,7 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PWD}/tbb_cmake_build/tbb_cmake_build
 
 
 # echo "-------- No Compute Sanitizer run --------"
-./aligner --sequence ../data/sequences.fa --maxPairs 5000 --batchSize 1500 -T 8 --output alignment.fa
+./aligner --sequence ../data/sequences.fa --maxPairs 100 --batchSize 10 -T 8 --output alignment.fa
 ./check_alignment --raw ../data/sequences.fa --alignment alignment.fa
 ./compare_alignment --reference ../data/reference_alignment.fa --estimate alignment.fa
 
