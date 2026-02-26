@@ -1,6 +1,5 @@
 /build/
 /results/
-/data/
 *.o
 *.a
 *.so
@@ -11,4 +10,3 @@
 *.sqlite
 *.nsys-rep
 *.csv
-*.xz
