@@ -325,7 +325,7 @@ __global__ void alignmentOnGPU (
                 dir = DIR_UP;   
             } else {
                 // Fetch direction from DP table
-                dir = d_tbDir[tbDirOffset + ti * maxSeqLen + tj];
+                dir = d_tbDir[tbDirOffset + ti * DP_STRIDE + tj];
             }
 
             // write in reverse order first
@@ -370,17 +370,18 @@ void GpuAligner::alignment() {
     // 3. Allocate full direction table in global memory
     // size = numPairs * maxLen * maxLen  (maxLen is known after allocateMem)
     uint8_t* d_tbDir = nullptr;
-    cudaError_t err = cudaMalloc(&d_tbDir, numPairs * longestLen * longestLen * sizeof(uint8_t));
+    cudaError_t err = cudaMalloc(&d_tbDir, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
         exit(1);
     }
-    cudaMemset(d_tbDir, 0, numPairs * longestLen * longestLen * sizeof(uint8_t));
+    cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
 
     // dynamic shared memory = wf_scores + shared_ref + shared_qry
     size_t smem_bytes = 3 * (longestLen + 1) * sizeof(int16_t)
                       + 2 * longestLen * sizeof(char);
 
+    printf("longestLen=%d smem_bytes=%zu\n", longestLen, smem_bytes);
     // 4. Perform the alignment on GPU
     alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir);
 
