@@ -179,14 +179,16 @@ __device__ __forceinline__ void max_score(
 // 3. tbDir now covers the full M*N table (not T*T tile)
 //      Because M*N can be large, tbDir lives in global memory (d_tbDir),
 // 4. Traceback walks from (M,N) to (0,0) over the full tbDir table
+// 5. Fix: wf_scores moved to global memory (d_wf) because shared mem is not large enough for big seq
+//    smem request was ~78KB for longestLen=9941, but A30 only has 48K per block
 */
 __global__ void alignmentOnGPU (
     int32_t* d_info,       // [0]: numPairs, [1]: maxSeqLen
     int32_t* d_seqLen,     // Array of sequence lengths
     char* d_seqs,          // Flat array of sequences
-    uint8_t* d_tb,          // Output traceback paths
-    uint8_t* d_tbDir       // full N*M direction table, global mem
-                           // size: numPairs * maxSeqLen * maxSeqLen
+    uint8_t* d_tb,         // Output traceback paths
+    uint8_t* d_tbDir,      // full N*M direction table, global mem
+    int16_t* d_wf
 ) {
     // -----------------------------------------------------------
     // KERNEL CONFIGURATION
@@ -217,8 +219,10 @@ __global__ void alignmentOnGPU (
     int32_t DP_STRIDE = maxSeqLen + 1;
     int32_t tbDirOffset = pair * DP_STRIDE * DP_STRIDE;  // full table
 
-    int32_t tb_stride = (maxSeqLen * 2 + 2);
+    int32_t tb_stride = maxSeqLen * 2 + 2;
     int32_t tbGlobalOffset = pair * tb_stride; 
+
+    int32_t wfOffset       = pair * 3 * DP_STRIDE;
 
     int32_t M = d_seqLen[2 * pair];      // ref len
     int32_t N = d_seqLen[2 * pair + 1];  // qry len
@@ -228,9 +232,8 @@ __global__ void alignmentOnGPU (
     // Shared memory
     // ---------------------------------------------------
     extern __shared__ char smem[];
-    int16_t* wf_scores  = (int16_t*)smem;                          // 3*(M+1) int16
-    char* shared_ref = (char*)(wf_scores + 3 * DP_STRIDE);     // M chars
-    char* shared_qry = shared_ref + maxSeqLen;                     // N chars
+    char* shared_ref = smem;
+    char* shared_qry = shared_ref + maxSeqLen;
 
     // Load the reference and query segments from global memory into shared memory
     // HINT: Using memory coalescing
@@ -238,6 +241,8 @@ __global__ void alignmentOnGPU (
     for (int j = tx; j < N; j += blockDim.x) shared_qry[j] = d_seqs[qryStart + j];
     __syncthreads();
 
+    // Initialize global wf buffer for this pair
+    int16_t* wf_scores = d_wf + wfOffset;
     for (int idx = tx; idx < 3 * DP_STRIDE; idx += blockDim.x) {
         wf_scores[idx] = -9999;
     }
@@ -249,9 +254,9 @@ __global__ void alignmentOnGPU (
     for (int k = 0; k <= M + N; ++k) {
 
         // Cyclic buffers for 3-wavefront dependency
-        int curr_k   = (k % 3) * (maxSeqLen + 1);
-        int pre_k    = ((k + 2) % 3) * (maxSeqLen + 1);
-        int prepre_k = ((k + 1) % 3) * (maxSeqLen + 1);
+        int curr_k   = (k % 3) * DP_STRIDE;
+        int pre_k    = ((k + 2) % 3) * DP_STRIDE;
+        int prepre_k = ((k + 1) % 3) * DP_STRIDE;
 
         // TODO: should we clear current diagonal buffer?
         for (int idx = tx; idx < DP_STRIDE; idx += blockDim.x) {
@@ -368,7 +373,6 @@ void GpuAligner::alignment() {
     transferSequence2Device();
 
     // 3. Allocate full direction table in global memory
-    // size = numPairs * maxLen * maxLen  (maxLen is known after allocateMem)
     uint8_t* d_tbDir = nullptr;
     cudaError_t err = cudaMalloc(&d_tbDir, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
     if (err != cudaSuccess) {
@@ -377,13 +381,20 @@ void GpuAligner::alignment() {
     }
     cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
 
-    // dynamic shared memory = wf_scores + shared_ref + shared_qry
-    size_t smem_bytes = 3 * (longestLen + 1) * sizeof(int16_t)
-                      + 2 * longestLen * sizeof(char);
+    // 4. Allocate wf_scores in global memory
+    int16_t* d_wf = nullptr;
+    err = cudaMalloc(&d_wf, numPairs * 3 * (longestLen+1) * sizeof(int16_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_wf): %s\n", cudaGetErrorString(err)); 
+        exit(1);
+    }
 
+    // dynamic shared memory = shared_ref + shared_qry
+    size_t smem_bytes = 2 * longestLen * sizeof(char);
     printf("longestLen=%d smem_bytes=%zu\n", longestLen, smem_bytes);
-    // 4. Perform the alignment on GPU
-    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir);
+
+    // 5. Perform the alignment on GPU
+    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir, d_wf);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -391,15 +402,16 @@ void GpuAligner::alignment() {
         exit(1);
     }
     
-    // 5. Transfer the traceback path from device
+    // 6. Transfer the traceback path from device
     TB_PATH tb_paths = transferTB2Host();
     cudaDeviceSynchronize();
     
-    // 6. Get the aligned sequence with traceback paths
+    // 7. Get the aligned sequence with traceback paths
     getAlignedSequences(tb_paths);
 
-    // 7. Free direction table
+    // 8. Free direction table
     cudaFree(d_tbDir);
+    cudaFree(d_wf);
 }
 
 
