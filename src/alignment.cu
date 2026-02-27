@@ -372,7 +372,7 @@ void GpuAligner::alignment() {
     transferSequence2Device();
 
 
-    const int DP_STRIDE = longestLen + 1;
+    const int DP_STRIDE = (size_t)longestLen + 1;
 
     // 3. allocate tbDir locally
     uint8_t* d_tbDir_local = nullptr;
@@ -498,8 +498,8 @@ void GpuAligner::clearAndReset () {
     cudaFree(d_seqs);
     cudaFree(d_seqLen);
     cudaFree(d_tb);
-    cudaFree(d_tbDir);
-    cudaFree(d_wf);
+    // cudaFree(d_tbDir);
+    // cudaFree(d_wf);
     seqs.clear();
     longestLen = 0;
     numPairs = 0;
