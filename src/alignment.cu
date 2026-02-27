@@ -42,7 +42,7 @@ void GpuAligner::allocateMem() {
     }
 
     // 5. Allocate wf_scores Buffer
-    err = cudaMalloc(&d_wf, numPairs * longestLen * sizeof(float));
+    err = cudaMalloc(&d_wf, numPairs * 3 * (longestLen + 1) * sizeof(int16_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -380,14 +380,6 @@ void GpuAligner::alignment() {
         exit(1);
     }
     cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
-
-    // 4. Allocate wf_scores in global memory
-    int16_t* d_wf = nullptr;
-    err = cudaMalloc(&d_wf, numPairs * 3 * (longestLen+1) * sizeof(int16_t));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR (d_wf): %s\n", cudaGetErrorString(err)); 
-        exit(1);
-    }
 
     // dynamic shared memory = shared_ref + shared_qry
     size_t smem_bytes = 2 * longestLen * sizeof(char);

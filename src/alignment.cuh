@@ -25,6 +25,7 @@ struct GpuAligner {
     uint8_t* d_tb;
     int32_t* d_seqLen;
     int32_t* d_info;
+    int16_t* d_wf;
 
     void alignment();
     void allocateMem();
