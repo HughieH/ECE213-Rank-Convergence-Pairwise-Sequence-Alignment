@@ -46,21 +46,6 @@ void GpuAligner::allocateMem() {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
     }
-
-    uint8_t* d_tbDir = nullptr;
-    err = cudaMalloc(&d_tbDir, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
-        exit(1);
-    }
-    cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
-
-    // 5. Allocate wf_scores Buffer
-    err = cudaMalloc(&d_wf, numPairs * 3 * (longestLen + 1) * sizeof(int16_t));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
-        exit(1);
-    }
 }
 
 /**
@@ -386,27 +371,66 @@ void GpuAligner::alignment() {
     // 2. Transfer sequence to device
     transferSequence2Device();
 
+
+    const int DP_STRIDE = longestLen + 1;
+
+    // 3. allocate tbDir locally
+    uint8_t* d_tbDir_local = nullptr;
+    size_t dir_bytes = (size_t)numPairs * DP_STRIDE * DP_STRIDE * sizeof(uint8_t);
+    cudaError_t err = cudaMalloc(&d_tbDir_local, dir_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    err = cudaMemset(d_tbDir_local, 0, dir_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (memset d_tbDir): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+
+    // 4. allocate wf buffer locally
+    int16_t* d_wf_local = nullptr;
+    size_t wf_bytes = (size_t)numPairs * 3 * DP_STRIDE * sizeof(int16_t);
+    err = cudaMalloc(&d_wf_local, wf_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_wf): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
     
 
     // dynamic shared memory = shared_ref + shared_qry
     size_t smem_bytes = 2 * longestLen * sizeof(char);
     printf("longestLen=%d smem_bytes=%zu\n", longestLen, smem_bytes);
 
-    // 3. Perform the alignment on GPU
-    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir, d_wf);
+    // 5. Perform the alignment on GPU
+    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir_local, d_wf_local);
 
-    cudaError_t err = cudaGetLastError();
+    // cudaError_t err = cudaGetLastError();
+    // if (err != cudaSuccess) {
+    //     fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+    //     exit(1);
+    // }
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        fprintf(stderr, "GPU_ERROR (launch): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (runtime): %s\n", cudaGetErrorString(err));
         exit(1);
     }
     
-    // 4. Transfer the traceback path from device
+    // 6. Transfer the traceback path from device
     TB_PATH tb_paths = transferTB2Host();
     cudaDeviceSynchronize();
     
-    // 5. Get the aligned sequence with traceback paths
+    // 7. Get the aligned sequence with traceback paths
     getAlignedSequences(tb_paths);
+
+    // 8. Free
+    cudaFree(d_tbDir_local);
+    cudaFree(d_wf_local);
 
 }
 
