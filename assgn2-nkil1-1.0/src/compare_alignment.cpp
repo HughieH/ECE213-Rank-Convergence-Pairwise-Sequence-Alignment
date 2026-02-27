@@ -14,16 +14,68 @@ const int MATCH_SCORE = 2;
 const int MISMATCH_SCORE = -1;
 const int GAP_SCORE = -2;
 
+
+static int8_t aa_to_idx_host[256];
+static bool aa_inited = false;
+
+static void init_aa_tables() {
+    if (aa_inited) return;
+    aa_inited = true;
+
+    for (int i = 0; i < 256; i++) aa_to_idx_host[i] = -1;
+    const char* AA = "ARNDCQEGHILKMFPSTWYV";
+    for (int i = 0; i < 20; i++) aa_to_idx_host[(unsigned char)AA[i]] = (int8_t)i;
+}
+
+static const int8_t blosum62_host[20 * 20] = {
+    // same 400 numbers as in alignment.cu
+     4,-1,-2,-2, 0,-1,-1, 0,-2,-1,-1,-1,-1,-2,-1, 1, 0,-3,-2, 0,
+    -1, 5, 0,-2,-3, 1, 0,-2, 0,-3,-2, 2,-1,-3,-2,-1,-1,-3,-2,-3,
+    -2, 0, 6, 1,-3, 0, 0, 0, 1,-3,-3, 0,-2,-3,-2, 1, 0,-4,-2,-3,
+    -2,-2, 1, 6,-3, 0, 2,-1,-1,-3,-4,-1,-3,-3,-1, 0,-1,-4,-3,-3,
+     0,-3,-3,-3, 9,-3,-4,-3,-3,-1,-1,-3,-1,-2,-3,-1,-1,-2,-2,-1,
+    -1, 1, 0, 0,-3, 5, 2,-2, 0,-3,-2, 1, 0,-3,-1, 0,-1,-2,-1,-2,
+    -1, 0, 0, 2,-4, 2, 5,-2, 0,-3,-3, 1,-2,-3,-1, 0,-1,-3,-2,-2,
+     0,-2, 0,-1,-3,-2,-2, 6,-2,-4,-4,-2,-3,-3,-2, 0,-2,-2,-3,-3,
+    -2, 0, 1,-1,-3, 0, 0,-2, 8,-3,-3,-1,-2,-1,-2,-1,-2,-2, 2,-3,
+    -1,-3,-3,-3,-1,-3,-3,-4,-3, 4, 2,-3, 1, 0,-3,-2,-1,-3,-1, 3,
+    -1,-2,-3,-4,-1,-2,-3,-4,-3, 2, 4,-2, 2, 0,-3,-2,-1,-2,-1, 1,
+    -1, 2, 0,-1,-3, 1, 1,-2,-1,-3,-2, 5,-1,-3,-1, 0,-1,-3,-2,-2,
+    -1,-1,-2,-3,-1, 0,-2,-3,-2, 1, 2,-1, 5, 0,-2,-1,-1,-1,-1, 1,
+    -2,-3,-3,-3,-2,-3,-3,-3,-1, 0, 0,-3, 0, 6,-4,-2,-2, 1, 3,-1,
+    -1,-2,-2,-1,-3,-1,-1,-2,-2,-3,-3,-1,-2,-4, 7,-1,-1,-4,-3,-2,
+     1,-1, 1, 0,-1, 0, 0, 0,-1,-2,-2, 0,-1,-2,-1, 4, 1,-3,-2,-2,
+     0,-1, 0,-1,-1,-1,-1,-2,-2,-1,-1,-1,-1,-2,-1, 1, 5,-2,-2, 0,
+    -3,-3,-4,-4,-2,-2,-3,-2,-2,-3,-2,-3,-1, 1,-4,-3,-2,11, 2,-3,
+    -2,-2,-2,-3,-2,-1,-2,-3, 2,-1,-1,-2,-1, 3,-3,-2,-2, 2, 7,-1,
+     0,-3,-3,-3,-1,-2,-2,-3,-3, 3, 1,-2, 1,-1,-2,-2, 0,-3,-1, 4
+};
+
+// try and auto detect if protein, as seen in alignment.cu
+static bool looksLikeProtein(const string& a, const string& b) {
+    auto check = [](char c) {
+        if (c == '-') return false;
+        if (c=='A' || c=='C' || c=='G' || c=='T' || c=='N') return false;
+        return true;
+    };
+    for (size_t i = 0; i < a.size(); i++) if (check(a[i])) return true;
+    for (size_t i = 0; i < b.size(); i++) if (check(b[i])) return true;
+    return false;
+}
+
 struct AlignmentPair {
     string seqA;
     string seqB;
     string name; // Optional, for reporting
 };
 
-// Function to calculate alignment score
+// Function to calculate alignment score (+ check scoring mode)
 long long calculateScore(const string& a, const string& b) {
     long long score = 0;
     size_t len = min(a.length(), b.length());
+
+    const bool isProtein = looksLikeProtein(a, b);
+    if (isProtein) init_aa_tables();
 
     for (size_t i = 0; i < len; ++i) {
         char c1 = a[i];
@@ -31,10 +83,15 @@ long long calculateScore(const string& a, const string& b) {
 
         if (c1 == '-' || c2 == '-') {
             score += GAP_SCORE;
-        } else if (c1 == c2) {
-            score += MATCH_SCORE;
+            continue;
+        }
+
+        if (!isProtein) {
+            score += (c1 == c2) ? MATCH_SCORE : MISMATCH_SCORE;
         } else {
-            score += MISMATCH_SCORE;
+            int8_t i1 = aa_to_idx_host[(unsigned char)c1];
+            int8_t i2 = aa_to_idx_host[(unsigned char)c2];
+            score += (i1 >= 0 && i2 >= 0) ? blosum62_host[i1 * 20 + i2] : MISMATCH_SCORE;
         }
     }
     return score;

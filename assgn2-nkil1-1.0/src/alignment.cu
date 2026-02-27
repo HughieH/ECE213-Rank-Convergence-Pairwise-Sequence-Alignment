@@ -5,6 +5,51 @@
 #include <fstream>
 #include <tbb/parallel_for.h>
 
+__device__ __constant__ int8_t d_aa_to_idx[256];
+__device__ __constant__ int8_t d_blosum62[20*20];
+
+static void initProteinTablesOnce() {
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+
+    // ASCII -> index in "ARNDCQEGHILKMFPSTWYV" 
+    int8_t aa_to_idx[256];
+    for (int i = 0; i < 256; i++) aa_to_idx[i] = -1;
+
+    const char* AA = "ARNDCQEGHILKMFPSTWYV";
+    for (int i = 0; i < 20; i++) {
+        aa_to_idx[(unsigned char)AA[i]] = (int8_t)i;
+    }
+
+    // BLOSUM62 in ordering: A R N D C Q E G H I L K M F P S T W Y V
+    static const int8_t blosum62[20 * 20] = {
+         4,-1,-2,-2, 0,-1,-1, 0,-2,-1,-1,-1,-1,-2,-1, 1, 0,-3,-2, 0, // A
+        -1, 5, 0,-2,-3, 1, 0,-2, 0,-3,-2, 2,-1,-3,-2,-1,-1,-3,-2,-3, // R
+        -2, 0, 6, 1,-3, 0, 0, 0, 1,-3,-3, 0,-2,-3,-2, 1, 0,-4,-2,-3, // N
+        -2,-2, 1, 6,-3, 0, 2,-1,-1,-3,-4,-1,-3,-3,-1, 0,-1,-4,-3,-3, // D
+         0,-3,-3,-3, 9,-3,-4,-3,-3,-1,-1,-3,-1,-2,-3,-1,-1,-2,-2,-1, // C
+        -1, 1, 0, 0,-3, 5, 2,-2, 0,-3,-2, 1, 0,-3,-1, 0,-1,-2,-1,-2, // Q
+        -1, 0, 0, 2,-4, 2, 5,-2, 0,-3,-3, 1,-2,-3,-1, 0,-1,-3,-2,-2, // E
+         0,-2, 0,-1,-3,-2,-2, 6,-2,-4,-4,-2,-3,-3,-2, 0,-2,-2,-3,-3, // G
+        -2, 0, 1,-1,-3, 0, 0,-2, 8,-3,-3,-1,-2,-1,-2,-1,-2,-2, 2,-3, // H
+        -1,-3,-3,-3,-1,-3,-3,-4,-3, 4, 2,-3, 1, 0,-3,-2,-1,-3,-1, 3, // I
+        -1,-2,-3,-4,-1,-2,-3,-4,-3, 2, 4,-2, 2, 0,-3,-2,-1,-2,-1, 1, // L
+        -1, 2, 0,-1,-3, 1, 1,-2,-1,-3,-2, 5,-1,-3,-1, 0,-1,-3,-2,-2, // K
+        -1,-1,-2,-3,-1, 0,-2,-3,-2, 1, 2,-1, 5, 0,-2,-1,-1,-1,-1, 1, // M
+        -2,-3,-3,-3,-2,-3,-3,-3,-1, 0, 0,-3, 0, 6,-4,-2,-2, 1, 3,-1, // F
+        -1,-2,-2,-1,-3,-1,-1,-2,-2,-3,-3,-1,-2,-4, 7,-1,-1,-4,-3,-2, // P
+         1,-1, 1, 0,-1, 0, 0, 0,-1,-2,-2, 0,-1,-2,-1, 4, 1,-3,-2,-2, // S
+         0,-1, 0,-1,-1,-1,-1,-2,-2,-1,-1,-1,-1,-2,-1, 1, 5,-2,-2, 0, // T
+        -3,-3,-4,-4,-2,-2,-3,-2,-2,-3,-2,-3,-1, 1,-4,-3,-2,11, 2,-3, // W
+        -2,-2,-2,-3,-2,-1,-2,-3, 2,-1,-1,-2,-1, 3,-3,-2,-2, 2, 7,-1, // Y
+         0,-3,-3,-3,-1,-2,-2,-3,-3, 3, 1,-2, 1,-1,-2,-2, 0,-3,-1, 4  // V
+    };
+
+    cudaMemcpyToSymbol(d_aa_to_idx, aa_to_idx, sizeof(aa_to_idx));
+    cudaMemcpyToSymbol(d_blosum62, blosum62, sizeof(blosum62));
+}
+
 /**
  * Allocates GPU memory for sequences, lengths, and traceback paths.
  * Calculates 'longestLen' to determine the stride for flattening the sequence array.
@@ -41,7 +86,7 @@ void GpuAligner::allocateMem() {
         exit(1);
     }
 
-    err = cudaMalloc(&d_info, 2 * sizeof(int32_t));
+    err = cudaMalloc(&d_info, 3 * sizeof(int32_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -91,10 +136,24 @@ void GpuAligner::transferSequence2Device() {
     }
 
     // 5. Transfer Meta Info
-    std::vector<int32_t> h_info (2);
+    std::vector<int32_t> h_info(3);
     h_info[0] = numPairs;
     h_info[1] = longestLen;
-    err = cudaMemcpy(d_info, h_info.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    // if any char is not A/C/G/T treat as protein
+    int isProtein = 0;
+    for (const auto& s : seqs) {
+        for (char c : s.seq) {
+            if (c!='A' && c!='C' && c!='G' && c!='T' && c!='N') { 
+                isProtein = 1;
+                break;
+            }
+        }
+        if (isProtein) break;
+    }
+    h_info[2] = isProtein;
+
+    err = cudaMemcpy(d_info, h_info.data(), 3 * sizeof(int32_t), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -205,8 +264,9 @@ __global__ void alignmentOnGPU (
     const uint8_t DIR_UP   = 2;
     const uint8_t DIR_LEFT = 3;
 
-    int32_t numPairs  = d_info[0];
+    int32_t numPairs = d_info[0];
     int32_t maxSeqLen = d_info[1];
+    int32_t isProtein = d_info[2];
 
     int pair = bx;
     if (pair >= numPairs) return;
@@ -294,7 +354,19 @@ __global__ void alignmentOnGPU (
                 char r_char = shared_ref[i - 1];
                 char q_char = shared_qry[j - 1];
                             
-                int16_t score_diag = wf_scores[prepre_k + (i - 1)] + (r_char == q_char ? MATCH : MISMATCH);
+                int16_t diag_base = wf_scores[prepre_k + (i - 1)];
+                int16_t score_diag;
+
+                if (!isProtein) {
+                    score_diag = diag_base + (r_char == q_char ? MATCH : MISMATCH);
+                } else {
+                    int8_t ri = d_aa_to_idx[(unsigned char)r_char];
+                    int8_t qi = d_aa_to_idx[(unsigned char)q_char];
+                    // minimal handling for unknown letters: treat as mismatch
+                    int16_t sub = (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : (int16_t)MISMATCH;
+                    score_diag = diag_base + sub;
+                }
+
                 int16_t score_up   = wf_scores[pre_k + (i - 1)] + GAP;
                 int16_t score_left = wf_scores[pre_k + i] + GAP;
 
@@ -371,6 +443,8 @@ void GpuAligner::alignment() {
     // 2. Transfer sequence to device
     transferSequence2Device();
 
+    initProteinTablesOnce();
+    alignmentOnGPU<<<numBlocks, blockSize>>>(d_info, d_seqLen, d_seqs, d_tb);
 
     const int DP_STRIDE = (size_t)longestLen + 1;
 
