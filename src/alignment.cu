@@ -41,6 +41,20 @@ void GpuAligner::allocateMem() {
         exit(1);
     }
 
+    err = cudaMalloc(&d_info, 2 * sizeof(int32_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
+        exit(1);
+    }
+
+    uint8_t* d_tbDir = nullptr;
+    err = cudaMalloc(&d_tbDir, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
+
     // 5. Allocate wf_scores Buffer
     err = cudaMalloc(&d_wf, numPairs * 3 * (longestLen + 1) * sizeof(int16_t));
     if (err != cudaSuccess) {
@@ -372,38 +386,28 @@ void GpuAligner::alignment() {
     // 2. Transfer sequence to device
     transferSequence2Device();
 
-    // 3. Allocate full direction table in global memory
-    uint8_t* d_tbDir = nullptr;
-    cudaError_t err = cudaMalloc(&d_tbDir, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR (d_tbDir): %s\n", cudaGetErrorString(err));
-        exit(1);
-    }
-    cudaMemset(d_tbDir, 0, numPairs * (longestLen+1) * (longestLen+1) * sizeof(uint8_t));
+    
 
     // dynamic shared memory = shared_ref + shared_qry
     size_t smem_bytes = 2 * longestLen * sizeof(char);
     printf("longestLen=%d smem_bytes=%zu\n", longestLen, smem_bytes);
 
-    // 5. Perform the alignment on GPU
+    // 3. Perform the alignment on GPU
     alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_tbDir, d_wf);
 
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
     }
     
-    // 6. Transfer the traceback path from device
+    // 4. Transfer the traceback path from device
     TB_PATH tb_paths = transferTB2Host();
     cudaDeviceSynchronize();
     
-    // 7. Get the aligned sequence with traceback paths
+    // 5. Get the aligned sequence with traceback paths
     getAlignedSequences(tb_paths);
 
-    // 8. Free direction table
-    cudaFree(d_tbDir);
-    cudaFree(d_wf);
 }
 
 
@@ -470,9 +474,12 @@ void GpuAligner::clearAndReset () {
     cudaFree(d_seqs);
     cudaFree(d_seqLen);
     cudaFree(d_tb);
+    cudaFree(d_tbDir);
+    cudaFree(d_wf);
     seqs.clear();
     longestLen = 0;
     numPairs = 0;
+
 }
 
 /**
