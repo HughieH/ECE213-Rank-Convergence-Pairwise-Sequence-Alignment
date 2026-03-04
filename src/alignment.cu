@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <fstream>
 #include <tbb/parallel_for.h>
-#define TILE 128
+#define TILE 512
 
 /**
  * Allocates GPU memory for sequences, lengths, and traceback paths.
@@ -173,14 +173,14 @@ __device__ __forceinline__ void max_score(
 
 
 /**
- * CUDA Kernel: Full NW global alignment on the GPU.
-// 1. Removed GACT tile loop
-// 2. Removed overlap/maxScore/best_ti/best_tj logic
-// 3. tbDir now covers the full M*N table (not T*T tile)
-//      Because M*N can be large, tbDir lives in global memory (d_tbDir),
-// 4. Traceback walks from (M,N) to (0,0) over the full tbDir table
-// 5. Fix: wf_scores moved to global memory (d_wf) because shared mem is not large enough for big seq
-//    smem request was ~78KB for longestLen=9941, but A30 only has 48K per block
+ * CUDA Kernel: Full tiled NW global alignment on the GPU. One block per pair.
+// Forward:
+// 1. Tile the MxN DP table into [TILE*TILE] tiles row by row, left to right
+// 2. Within each tile, anti-diagonal wavefront parallelism in shared mem
+// 3. Only boundary scores between tile-rows are saved to global mem
+// Traceback:
+// 1. For each tile on the path, recomputre its boundary by reruning the preceding tile
+// 2. Then rerun the tile to get score and trace using the scores.
 */
 
 
@@ -192,7 +192,8 @@ __global__ void alignmentOnGPU (
     uint8_t* d_tb,         // Output traceback paths
     int16_t* d_H_bnd,      // Boundary [numPairs][tile_rows_max+1][maxSeqLen+1]
     int32_t  tile_rows_max,
-    int32_t  bnd_cols      // maxSeqLen + 1
+    int32_t  bnd_cols,      // maxSeqLen + 1
+    int16_t* d_tile_dp    // per pair tile DP buffer
 ) {
     // -----------------------------------------------------------
     // KERNEL CONFIGURATION
@@ -234,6 +235,10 @@ __global__ void alignmentOnGPU (
     int64_t hb_pair_offset = pair * (tile_rows_max + 1) * bnd_cols;
     int16_t* H_bnd = d_H_bnd + hb_pair_offset;
 
+    // pointer to this pair's tile DP buffer
+    int DP_TILE_STRIDE = TILE + 1;
+    int16_t* tile_dp = d_tile_dp + pair * DP_TILE_STRIDE * DP_TILE_STRIDE;
+
 
 
     // ---------------------------------------------------
@@ -247,13 +252,13 @@ __global__ void alignmentOnGPU (
     int16_t* s_bot = s_left + (TILE + 1);
     int16_t* s_right = s_bot + (TILE + 1);
     int16_t* wf_scores = s_right + (TILE + 1);
-    uint8_t* s_dir = (uint8_t*)(wf_scores + 3 * (TILE + 1));
+    // uint8_t* s_dir = (uint8_t*)(wf_scores + 3 * (TILE + 1));
 
     const int WF_STRIDE = TILE + 1;
 
     // initialize H_bnd[0][j] = j * GAP
     for (int j = tx; j <= N; j += blockDim.x) {
-        H_bnd[0 * bnd_cols + j] = (int16_t)(j * GAP);
+        H_bnd[0 * bnd_cols + j] = j * GAP;
     }
     __syncthreads();
 
@@ -313,7 +318,6 @@ __global__ void alignmentOnGPU (
                     // -- Boundary Conditions --
                     if (i == 0 && j == 0) {
                         score = s_top[0];
-                        // no direction needed for origin
                     }
                     else if (i == 0) {
                         score = s_top[j];
@@ -322,7 +326,7 @@ __global__ void alignmentOnGPU (
                         score = s_left[i];
                     } 
                     else {
-                        // -- Inner Matrix Calculation --
+                        // -- Inner Cell Calculation --
                         char r_char = shared_ref[i - 1];
                         char q_char = shared_qry[j - 1];
                         // diag neighbor (i-1, j-1): diagonal k-2
@@ -339,8 +343,10 @@ __global__ void alignmentOnGPU (
 
                         // up neighbor (i-1, j): diagonal k-1
                         int16_t score_up;
-                        if (i - 1 == 0) score_up = s_top[j];
-                        else score_up = wf_scores[pre_k + (i - 1)];
+                        if (i - 1 == 0)
+                            score_up = s_top[j];
+                        else
+                            score_up = wf_scores[pre_k + (i - 1)];
                         score_up += GAP;
 
                         // left neighbor (i, j-1): diagonal k-1
@@ -391,7 +397,8 @@ __global__ void alignmentOnGPU (
                 d_tb[tbGlobalOffset + localLen++] = DIR_LEFT;
                 gj--;
                 continue;
-            } if (gj == 0) { 
+            }
+            if (gj == 0) { 
                 d_tb[tbGlobalOffset + localLen++] = DIR_UP;
                 gi--;
                 continue;
@@ -475,6 +482,12 @@ __global__ void alignmentOnGPU (
             int16_t* col_prev = wf_scores;
             int16_t* col_curr = wf_scores + (TILE + 1);
             for (int i = 0; i <= tM; i++) col_prev[i] = s_left[i];
+            // left bnd
+            for (int i = 0; i = tM; i++) 
+                tile_dp[i*DP_TILE_STRIDE] = s_left[i];
+            // top bnd
+            for (int j = 0; j <= tN; j++)
+                tile_dp[j] = s_top[j]; 
 
             for (int j = 1; j <= tN; j++) {
                 col_curr[0] = s_top[j];
@@ -487,17 +500,17 @@ __global__ void alignmentOnGPU (
                     int16_t sl = col_prev[i] + GAP; // left = score(i, j-1)
 
                     int16_t best = sd;
-                    uint8_t dir = DIR_DIAG;
+                    // uint8_t dir = DIR_DIAG;
                     if (su > best) {
                         best = su;
-                        dir = DIR_UP;
+                        // dir = DIR_UP;
                     }
                     if (sl > best) {
                         best = sl;
-                        dir = DIR_LEFT;
+                        // dir = DIR_LEFT;
                     }
                     col_curr[i] = best;
-                    s_dir[(i - 1) * TILE + (j - 1)] = dir;
+                    tile_dp[i * DP_TILE_STRIDE + j] = best;
                 }
                 int16_t* tmp = col_prev;
                 col_prev = col_curr;
@@ -506,9 +519,23 @@ __global__ void alignmentOnGPU (
 
         // trace within tile until we hit the boundary
         while (li >= 1 && lj >= 1) {
-            uint8_t dir = s_dir[(li - 1) * TILE + (lj - 1)];
+            char r = shared_ref[li - 1];
+            char q = shared_qry[lj - 1];
+            int16_t sd = tile_dp[(li-1) * DP_TILE_STRIDE + (lj-1)]+ (r == q ? MATCH : MISMATCH);
+            int16_t su = tile_dp[(li-1) * DP_TILE_STRIDE + lj] + GAP;
+            int16_t sl = tile_dp[li * DP_TILE_STRIDE + (lj-1)] + GAP;
+            uint8_t dir = DIR_DIAG;
+            int16_t best = sd;
+            if (su > best) {
+                best = su;
+                dir = DIR_UP;
+            }
+            if (sl > best) {
+                best = sl;
+                dir = DIR_LEFT;
+            }
             d_tb[tbGlobalOffset + localLen++] = dir;
-            if ((localLen >= tb_stride - 1)) break;
+            if (localLen >= tb_stride - 1) break;
 
             // Move coordinates
             if (dir == DIR_DIAG) { gi--; gj--; li--; lj--; }
@@ -559,15 +586,25 @@ void GpuAligner::alignment() {
     }
 
     // shared memory
+    // each pair needs (TILE+1)^2 int16_t to store a tile's full score matrix.
+    size_t tile_dp_stride = (TILE + 1) * (TILE + 1);
+    size_t tile_dp_bytes = numPairs * tile_dp_stride * sizeof(int16_t);
+
+    int16_t* d_tile_dp = nullptr;
+    err = cudaMalloc(&d_tile_dp, tile_dp_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_tile_dp): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    // removed TILE*TILE for s_dir
     size_t smem_bytes = 2 * TILE                          // shared_ref, shared_qry
                       + 4 * (TILE + 1) * sizeof(int16_t)  // s_top, s_left, s_bot, s_right
-                      + 3 * (TILE + 1) * sizeof(int16_t)  // wf_scores
-                      + TILE * TILE;                      // s_dir
-    printf("longestLen=%d tile_rows_max=%d hb_bytes=%zu (%.1f MB) smem_bytes=%zu\n",
-           longestLen, tile_rows_max, hb_bytes, hb_bytes / 1048576.0, smem_bytes);
+                      + 3 * (TILE + 1) * sizeof(int16_t);  // wf_scores
+    // printf("longestLen=%d tile_rows_max=%d hb_bytes=%zu (%.1f MB) smem_bytes=%zu\n",
+    //        longestLen, tile_rows_max, hb_bytes, hb_bytes / 1048576.0, smem_bytes);
 
-    // 3. Perform the alignment on GPU
-    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_H_bnd, tile_rows_max, bnd_cols);
+    // 4. Perform the alignment on GPU
+    alignmentOnGPU<<<numBlocks, blockSize, smem_bytes>>>(d_info, d_seqLen, d_seqs, d_tb, d_H_bnd, tile_rows_max, bnd_cols, d_tile_dp);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -580,15 +617,17 @@ void GpuAligner::alignment() {
         exit(1);
     }
 
-    // 4. Transfer the traceback path from device
+    // 5. Transfer the traceback path from device
     TB_PATH tb_paths = transferTB2Host();
     cudaDeviceSynchronize();
 
-    // 5. Get the aligned sequence with traceback paths
+    // 6. Get the aligned sequence with traceback paths
     getAlignedSequences(tb_paths);
 
-    // 6. Free
+    // 7. Free
     cudaFree(d_H_bnd);
+    cudaFree(d_tile_dp);
+
 
 }
 
@@ -656,6 +695,7 @@ void GpuAligner::clearAndReset () {
     cudaFree(d_seqs);
     cudaFree(d_seqLen);
     cudaFree(d_tb);
+    cudaFree(d_info);
     // cudaFree(d_tbDir);
     // cudaFree(d_wf);
     seqs.clear();
