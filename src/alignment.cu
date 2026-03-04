@@ -20,7 +20,7 @@ void GpuAligner::allocateMem() {
     
     // 2. Allocate flat array for all sequences (Reference + Query pairs)
     // Layout: [Seq0_Ref ...pad... | Seq0_Qry ...pad... | Seq1_Ref ... ]
-    err = cudaMalloc(&d_seqs, numPairs * 2 * longestLen * sizeof(char));
+    err = cudaMalloc(&d_seqs, (size_t)numPairs * 2 * longestLen * sizeof(char));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -36,7 +36,7 @@ void GpuAligner::allocateMem() {
     // 4. Allocate Traceback Buffer
     // Worst case path is roughly 2x sequence length (all gaps)
     int tb_length = longestLen * 2 + 2; 
-    err = cudaMalloc(&d_tb, numPairs * tb_length * sizeof(uint8_t));
+    err = cudaMalloc(&d_tb, (size_t)numPairs * tb_length * sizeof(uint8_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -57,15 +57,15 @@ void GpuAligner::transferSequence2Device() {
     
     // 1. Flatten sequences on Host
     // We use a fixed stride 'longestLen' to simplify indexing on the GPU
-    std::vector<char> h_seqs(longestLen * numPairs * 2, 0); 
+    std::vector<char> h_seqs((size_t)longestLen * numPairs * 2, 0); 
     
-    for (size_t i = 0; i < numPairs * 2; ++i) {
+    for (size_t i = 0; i < (size_t)numPairs * 2; ++i) {
         const std::string& s = seqs[i].seq;
         std::memcpy(h_seqs.data() + (i * longestLen), s.data(), s.size());
     }
 
     // 2. Transfer flattened sequences to Device
-    err = cudaMemcpy(d_seqs, h_seqs.data(), longestLen * numPairs * 2 * sizeof(char), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_seqs, h_seqs.data(), (size_t)longestLen * numPairs * 2 * sizeof(char), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -83,9 +83,9 @@ void GpuAligner::transferSequence2Device() {
 
     // 4. Initialize Traceback buffer on Device (Zero out)
     int tb_length = longestLen * 2 + 2;
-    std::vector<uint8_t> h_tb (tb_length * numPairs, 0);
+    // std::vector<uint8_t> h_tb (tb_length * numPairs, 0);
     
-    err = cudaMemcpy(d_tb, h_tb.data(), tb_length * numPairs * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    err = cudaMemset(d_tb, 0, (size_t)tb_length * numPairs * sizeof(uint8_t));
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -107,9 +107,9 @@ void GpuAligner::transferSequence2Device() {
  */
 TB_PATH GpuAligner::transferTB2Host() {
     int tb_length = longestLen * 2 + 2;
-    TB_PATH h_tb(tb_length * numPairs);
+    TB_PATH h_tb((size_t)tb_length * numPairs);
 
-    cudaError_t err = cudaMemcpy(h_tb.data(), d_tb, tb_length * numPairs * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    cudaError_t err = cudaMemcpy(h_tb.data(), d_tb, (size_t)tb_length * numPairs * sizeof(uint8_t), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR: %s (%s)\n", cudaGetErrorString(err), cudaGetErrorName(err));
         exit(1);
@@ -232,12 +232,12 @@ __global__ void alignmentOnGPU (
     int32_t tbGlobalOffset = pair * tb_stride; 
 
     // pointer to this pair's boundary storage
-    int64_t hb_pair_offset = pair * (tile_rows_max + 1) * bnd_cols;
+    int64_t hb_pair_offset = (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
     int16_t* H_bnd = d_H_bnd + hb_pair_offset;
 
     // pointer to this pair's tile DP buffer
     int DP_TILE_STRIDE = TILE + 1;
-    int16_t* tile_dp = d_tile_dp + pair * DP_TILE_STRIDE * DP_TILE_STRIDE;
+    int16_t* tile_dp = d_tile_dp + (int64_t)pair * DP_TILE_STRIDE * DP_TILE_STRIDE;
 
 
 
@@ -571,7 +571,7 @@ void GpuAligner::alignment() {
     int32_t tile_rows_max = (longestLen + TILE - 1) / TILE;
     // 3. Allocate boundary storage: [numPairs][tile_rows_max+1][longestLen+1]
     int32_t bnd_cols = longestLen + 1;
-    size_t hb_bytes = numPairs * (tile_rows_max + 1) * bnd_cols * sizeof(int16_t);
+    size_t hb_bytes = (size_t)numPairs * (tile_rows_max + 1) * bnd_cols * sizeof(int16_t);
 
     int16_t* d_H_bnd = nullptr;
     cudaError_t err = cudaMalloc(&d_H_bnd, hb_bytes);
@@ -587,8 +587,8 @@ void GpuAligner::alignment() {
 
     // shared memory
     // each pair needs (TILE+1)^2 int16_t to store a tile's full score matrix.
-    size_t tile_dp_stride = (TILE + 1) * (TILE + 1);
-    size_t tile_dp_bytes = numPairs * tile_dp_stride * sizeof(int16_t);
+    size_t tile_dp_stride = (size_t)(TILE + 1) * (TILE + 1);
+    size_t tile_dp_bytes = (size_t)numPairs * tile_dp_stride * sizeof(int16_t);
 
     int16_t* d_tile_dp = nullptr;
     err = cudaMalloc(&d_tile_dp, tile_dp_bytes);
