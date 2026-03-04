@@ -483,7 +483,7 @@ __global__ void alignmentOnGPU (
             int16_t* col_curr = wf_scores + (TILE + 1);
             for (int i = 0; i <= tM; i++) col_prev[i] = s_left[i];
             // left bnd
-            for (int i = 0; i = tM; i++) 
+            for (int i = 0; i <= tM; i++) 
                 tile_dp[i*DP_TILE_STRIDE] = s_left[i];
             // top bnd
             for (int j = 0; j <= tN; j++)
