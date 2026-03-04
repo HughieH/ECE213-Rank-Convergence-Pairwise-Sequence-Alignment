@@ -26,12 +26,15 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PWD}/tbb_cmake_build/tbb_cmake_build
 # ./compare_alignment --reference ../data/reference_alignment.fa --estimate alignment.fa # add -v to see pair-wise comparisons
 
 
-
 # echo "-------- No Compute Sanitizer run --------"
-./aligner --sequence ../data/sequences.fa --maxPairs 200 --batchSize 50 -T 8 --output alignment.fa
-./check_alignment --raw ../data/sequences.fa --alignment alignment.fa
-./compare_alignment --reference ../data/reference_alignment.fa --estimate alignment.fa
+# ./aligner --sequence ../data/sequences.fa --maxPairs 200 --batchSize 50 -T 8 --output alignment.fa
+# ./check_alignment --raw ../data/sequences.fa --alignment alignment.fa
+# ./compare_alignment --reference ../data/reference_alignment.fa --estimate alignment.fa
 
+# -- sars_20000 dataset check --
+./aligner --sequence ../data/sars_20000.fa --maxPairs 200 --batchSize 150 -T 8 --output ../data/sars_alignment.fa
+./check_alignment --raw ../data/sars_20000.fa --alignment ../data/sars_alignment.fa
+./compare_alignment --reference ../data/sars_20000.msa --estimate ../data/sars_alignment.fa
 
 # echo "-------- Compute Sanitizer run ------"
 # compute-sanitizer ./aligner --sequence ../data/sequences.fa --maxPairs 5000 --batchSize 1500 -T 8 --output alignment_sanitizer.fa
