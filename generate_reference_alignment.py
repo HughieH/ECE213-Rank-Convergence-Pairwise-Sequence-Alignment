@@ -49,8 +49,21 @@ def main():
     aligner = PairwiseAligner()
     aligner.mode = 'global' # Use NW global alignment
     aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
-    aligner.open_gap_score = args.gap                             
-    aligner.extend_gap_score = 0                                 
+    # aligner.open_gap_score = args.gap                             
+    # aligner.extend_gap_score = 0         
+
+    # Linear gap: cost = -2 
+    aligner.open_gap_score   = -2
+    aligner.extend_gap_score = -2   
+
+    aligner.target_left_open_gap_score    = -2
+    aligner.target_left_extend_gap_score  = -2
+    aligner.target_right_open_gap_score   = -2
+    aligner.target_right_extend_gap_score = -2
+    aligner.query_left_open_gap_score     = -2
+    aligner.query_left_extend_gap_score   = -2
+    aligner.query_right_open_gap_score    = -2
+    aligner.query_right_extend_gap_score  = -2                       
 
     records = list(SeqIO.parse(args.input, "fasta"))
 
