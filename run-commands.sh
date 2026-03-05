@@ -25,8 +25,8 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PWD}/tbb_cmake_build/tbb_cmake_build
 
 # -- WOL2 Protein dataset check --
 # NOTE: MAKE SURE to pass in the --protein flag for ./aligner & ./compare_alignment
-./aligner --protein --sequence ../data/subset_wol2_protein_2000.faa --maxPairs 1000 --batchSize 1000 --numThreads 8 --output ../data/protein_alignment.fa
-./check_alignment --raw ../data/subset_wol2_protein_2000.faa --alignment ../data/protein_alignment.fa               
+./aligner --protein --sequence ../data/subset_wol2_protein_10000.faa --maxPairs 5000 --batchSize 1000 --numThreads 8 --output ../data/protein_alignment.fa
+./check_alignment --raw ../data/subset_wol2_protein_10000.faa --alignment ../data/protein_alignment.fa               
 ./compare_alignment --protein -v --reference ../data/reference_protein_alignment.fa --estimate ../data/protein_alignment.fa
 
 # -- sars_20000 dataset check --

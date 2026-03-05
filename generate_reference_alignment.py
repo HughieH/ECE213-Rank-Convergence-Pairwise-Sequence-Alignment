@@ -11,7 +11,8 @@ Usage:
     python generate_reference_alignment.py -i input.faa -o output.faa
 
 Example usage w/ our WOL2 protein dataset:
-    python generate_reference_alignment.py -i ./data/subset_wol2_protein_2000.faa -o ./data/reference_protein_alignment.fa
+
+    python generate_reference_alignment.py -i ./data/subset_wol2_protein_10000.faa -o ./data/reference_protein_alignment.fa
 
 NOTE: Run `pip install Bio` before running script, its a key dependancy for the script.
 """
