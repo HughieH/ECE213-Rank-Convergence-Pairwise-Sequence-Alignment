@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     ("numThreads,T", po::value<uint32_t>(&numThreads)->default_value(4), "Number of Threads (range: 1-8)")
     ("maxPairs,N", po::value<uint32_t>(&maxPairs)->default_value(5000), "Maximum number of sequence pairs to read from the input sequence file")
     ("batchSize,b", po::value<uint32_t>(&batchSize)->default_value(1000), "Number of pairs in a batch. Note: each batch consists of 2x batchSize sequences.")
+    ("protein,p", po::bool_switch(), "Protein sequence alignment. Uses the BLOSUM62 scoring matrix.")
     ("help,h", "Print help messages");
 
     po::options_description allOptions;
@@ -68,9 +69,17 @@ int main(int argc, char** argv) {
     fprintf(stdout, "Setting CPU threads to %u and printing GPU device properties.\n", numThreads);
     tbb::global_control init(tbb::global_control::max_allowed_parallelism, numThreads);
     printGpuProperties();
-
     
     GpuAligner Aligner;
+
+    // Check if doing protein alignment, otherwise default to DNA
+    bool isProtein = vm["protein"].as<bool>();
+    Aligner.isProtein = isProtein;
+    if (isProtein) {
+        std::cout << "Protein alignment mode enabled, using BLOSUM62 matrix" << std::endl;
+    } else {
+        std::cout << "DNA alignment mode enabled, using simple MATCH/MISMATCH for scoring" << std::endl;
+    }
     int totSequenceCount = 0;
     int currSequenceCount = 0;
     // Read in the read sequences

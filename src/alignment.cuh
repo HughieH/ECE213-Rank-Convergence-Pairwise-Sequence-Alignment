@@ -20,6 +20,7 @@ struct GpuAligner {
     std::vector<Sequence> seqs;
     int32_t longestLen;
     int32_t numPairs;
+    bool isProtein;
 
     char*    d_seqs;
     uint8_t* d_tb;

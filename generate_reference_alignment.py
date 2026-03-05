@@ -42,28 +42,26 @@ def main():
     parser.add_argument('-i', '--input',  required=True, help='Input .faa file')
     parser.add_argument('-o', '--output', required=True, help='Output aligned FASTA file')
     parser.add_argument('--gap', type=float, default=-2.0,
-                        help='Linear gap penalty (default: -2, matches CUDA kernel)')
+                        help='Linear gap penalty (default: -2, matches our CUDA implementation)')
     args = parser.parse_args()
 
     # Configure aligner to match our scoring matrix
     aligner = PairwiseAligner()
+    
     aligner.mode = 'global' # Use NW global alignment
     aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
-    # aligner.open_gap_score = args.gap                             
-    # aligner.extend_gap_score = 0         
 
-    # Linear gap: cost = -2 
-    aligner.open_gap_score   = -2
-    aligner.extend_gap_score = -2   
-
-    aligner.target_left_open_gap_score    = -2
-    aligner.target_left_extend_gap_score  = -2
-    aligner.target_right_open_gap_score   = -2
-    aligner.target_right_extend_gap_score = -2
-    aligner.query_left_open_gap_score     = -2
-    aligner.query_left_extend_gap_score   = -2
-    aligner.query_right_open_gap_score    = -2
-    aligner.query_right_extend_gap_score  = -2                       
+    # Linear gap penalty, default to -2
+    aligner.open_gap_score   = args.gap
+    aligner.extend_gap_score = args.gap
+    aligner.target_left_open_gap_score    = args.gap
+    aligner.target_left_extend_gap_score  = args.gap
+    aligner.target_right_open_gap_score   = args.gap
+    aligner.target_right_extend_gap_score = args.gap
+    aligner.query_left_open_gap_score     = args.gap
+    aligner.query_left_extend_gap_score   = args.gap
+    aligner.query_right_open_gap_score    = args.gap
+    aligner.query_right_extend_gap_score  = args.gap                  
 
     records = list(SeqIO.parse(args.input, "fasta"))
 

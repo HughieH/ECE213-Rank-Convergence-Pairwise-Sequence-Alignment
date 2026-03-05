@@ -186,8 +186,12 @@ int main(int argc, char* argv[]) {
     bool isProtein = vm["protein"].as<bool>();
 
     // Initialize BLOSUM62 lookup tables if protein mode
-    if (isProtein) init_aa_tables();
-
+    if (isProtein) {
+        init_aa_tables();
+        cout << "Protein scoring mode enabled, using BLOSUM62 matrix" 
+         << "\n" << endl;
+    }
+    
     // 2. Read Files
     if (verbose) cout << "Reading Estimate file: " << estFile << "..." << endl;
     vector<AlignmentPair> estAligns = readAlignments(estFile);

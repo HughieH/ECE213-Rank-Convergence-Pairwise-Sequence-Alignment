@@ -53,6 +53,24 @@ static void initProteinTablesOnce() {
     cudaMemcpyToSymbol(d_blosum62, blosum62, sizeof(blosum62));
 }
 
+/**
+ * Helper function to calculate substituion score.
+ * MATCH/MISMATCH for DNA, BLOSUM62 matrix for Protein amino acids
+ */
+__device__ __forceinline__ int16_t subScore(
+    char r, char q,
+    int32_t isProtein,
+    int16_t MATCH, int16_t MISMATCH
+) {
+    if (!isProtein) {
+        return (r == q) ? MATCH : MISMATCH;
+    }
+    int8_t ri = d_aa_to_idx[(unsigned char)r];
+    int8_t qi = d_aa_to_idx[(unsigned char)q];
+    // Find score for ref and query AAs in the matrix, use MISMATCH in the worst case the AA is not in the matrix
+    return (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : MISMATCH; 
+}
+
 
 /**
  * Allocates GPU memory for sequences, lengths, and traceback paths.
@@ -143,19 +161,7 @@ void GpuAligner::transferSequence2Device() {
     std::vector<int32_t> h_info(3);
     h_info[0] = numPairs;
     h_info[1] = longestLen;
-
-    // if any char is not A/C/G/T/N treat as protein
-    int isProtein = 0;
-    for (const auto& s : seqs) {
-        for (char c : s.seq) {
-            if (c!='A' && c!='C' && c!='G' && c!='T' && c!='N') {
-                isProtein = 1;
-                break;
-            }
-        }
-        if (isProtein) break;
-    }
-    h_info[2] = isProtein;
+    h_info[2] = isProtein ? 1: 0; // Pass in 1 if isProtein flag is enabled in main entrypoint
 
     err = cudaMemcpy(d_info, h_info.data(), 3 * sizeof(int32_t), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -397,14 +403,7 @@ __global__ void alignmentOnGPU (
                         else                               diag_base = wf_scores[prepre_k + (i - 1)];
 
                         // substitution score: BLOSUM62 for protein, MATCH/MISMATCH for DNA
-                        int16_t sub;
-                        if (!isProtein) {
-                            sub = (r_char == q_char) ? MATCH : MISMATCH;
-                        } else {
-                            int8_t ri = d_aa_to_idx[(unsigned char)r_char];
-                            int8_t qi = d_aa_to_idx[(unsigned char)q_char];
-                            sub = (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : (int16_t)MISMATCH;
-                        }
+                        int16_t sub = subScore(r_char, q_char, isProtein, MATCH, MISMATCH);
                         int16_t score_diag = diag_base + sub;
 
                         // up neighbor (i-1, j): diagonal k-1
@@ -511,18 +510,8 @@ __global__ void alignmentOnGPU (
                         for (int i = 1; i <= tM; i++) {
                             char r = local_ref[i - 1];
                             char q = local_qry[j - 1];
-                            
-                            // If protein use blosum matrix to calculate substitution
-                            // TODO: Can probably make this into a helper function
-                            int16_t sub;
-                            if (!isProtein) {
-                                sub = (r == q) ? MATCH : MISMATCH;
-                            } else {
-                                int8_t ri = d_aa_to_idx[(unsigned char)r];
-                                int8_t qi = d_aa_to_idx[(unsigned char)q];
-                                sub = (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : (int16_t)MISMATCH;
-                            }
-
+                            // Calculate substitution score
+                            int16_t sub = subScore(r, q, isProtein, MATCH, MISMATCH);
                             int16_t sd   = col_prev[i - 1] + sub;
                             int16_t su   = col_curr[i - 1] + GAP;
                             int16_t sl   = col_prev[i]     + GAP;
@@ -562,16 +551,8 @@ __global__ void alignmentOnGPU (
                     char r = shared_ref[i - 1];
                     char q = shared_qry[j - 1];
 
-                    // If protein use blosum matrix to calculate substitution
-                    int16_t sub;
-                    if (!isProtein) {
-                        sub = (r == q) ? MATCH : MISMATCH;
-                    } else {
-                        int8_t ri = d_aa_to_idx[(unsigned char)r];
-                        int8_t qi = d_aa_to_idx[(unsigned char)q];
-                        sub = (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : (int16_t)MISMATCH;
-                    }
-
+                    // Calculate substitution score
+                    int16_t sub = subScore(r, q, isProtein, MATCH, MISMATCH);
                     int16_t sd   = col_prev[i - 1] + sub;
                     int16_t su   = col_curr[i - 1] + GAP; // up = score(i-1, j)
                     int16_t sl   = col_prev[i]     + GAP; // left = score(i, j-1)
@@ -593,15 +574,8 @@ __global__ void alignmentOnGPU (
                 char r = shared_ref[li - 1];
                 char q = shared_qry[lj - 1];
                 
-                // If protein use blosum matrix to calculate substitution
-                int16_t sub;
-                if (!isProtein) {
-                    sub = (r == q) ? MATCH : MISMATCH;
-                } else {
-                    int8_t ri = d_aa_to_idx[(unsigned char)r];
-                    int8_t qi = d_aa_to_idx[(unsigned char)q];
-                    sub = (ri >= 0 && qi >= 0) ? (int16_t)d_blosum62[ri * 20 + qi] : (int16_t)MISMATCH;
-                }
+                // Calculate substitution score
+                int16_t sub = subScore(r, q, isProtein, MATCH, MISMATCH);
 
                 int16_t sd   = tile_dp[(li - 1) * DP_TILE_STRIDE + (lj - 1)] + sub;
                 int16_t su   = tile_dp[(li - 1) * DP_TILE_STRIDE + lj] + GAP;
@@ -646,8 +620,8 @@ void GpuAligner::alignment() {
     // 2. Transfer sequences to device
     transferSequence2Device();
 
-    // 3. Upload BLOSUM62 / aa_to_idx to constant memory
-    initProteinTablesOnce();
+    // 3. Upload BLOSUM62 / aa_to_idx to constant memory if this is a protein alignment
+    if (isProtein) initProteinTablesOnce();
 
     int32_t tile_rows_max = (longestLen + TILE - 1) / TILE;
 
