@@ -1,15 +1,29 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/zd3UrbhA)
-# ECE 213: Assignment 2
+# ECE 213 Project — Rank Convergence Pairwise Sequence Alignment
 
-## Contents
-* [Deadlines](#deadlines)
-* [Overview](#overview)
-* [Setting up](#setting-up)
-* [Code development and testing](#code-development-and-testing)
-* [Submission guidelines](#submission-guidelines)
+**Team:** Hou Wai Wan, Noah Kil, Zhao Cai
 
-## Deadlines
-- Assignment 2: Tuesday, Feb 17 2026 (by 11:59pm PT)
+***
+
+## Overview
+
+This project implements GPU-accelerated pairwise sequence alignment using the **Rank Convergence (RC)** method to expose across-stage parallelism in the Needleman-Wunsch (NW) dynamic programming algorithm. Unlike standard wavefront NW which must process stages sequentially, RC splits the stage sequence into parallel chunks that start from an arbitrary frontier and iteratively converge to the correct solution, enabling significantly more GPU-friendly execution.
+
+Both **DNA** (MATCH/MISMATCH scoring) and **protein** (BLOSUM62 scoring) alignment are supported.
+
+## Datasets
+
+- **DNA:** SARS-CoV-2 sequences (`data/sars_20000.fa`, `data/sars_20000.msa`) *NOTE: sars dataset is too large to be stored on github, curl dataset into DSLMP*
+- **Protein:** WOL2 database subset (`data/subset_wol2_protein_<number of sequences>.faa`) — BLOSUM62 scoring
+
+## Baselines
+
+- **Baseline 1 (CPU):** Python script using the Biopython library, used for generating reference protein sequences `generate_reference_alignment.py`
+- **Baseline 2 (GPU):** Tiled wavefront NW (`src/alignment.cu` in branch `baseline-tiling-with-protein`)
+- **Project goal:** Rank Convergence GPU NW
+
+***
+
+*NOTE: Below is the PA2 reademe, useful for setting up the repo*
 
 ## Overview
 
