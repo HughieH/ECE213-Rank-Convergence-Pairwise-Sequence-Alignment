@@ -56,6 +56,18 @@ struct AlignmentPair {
     string name; // Optional, for reporting
 };
 
+// Strip columns where BOTH sequences have '-' (MSA-only artifact columns)
+pair<string, string> stripGapOnlyColumns(const string& a, const string& b) {
+    string outA, outB;
+    size_t len = min(a.size(), b.size());
+    for (size_t i = 0; i < len; ++i) {
+        if (a[i] == '-' && b[i] == '-') continue;
+        outA += a[i];
+        outB += b[i];
+    }
+    return {outA, outB};
+}
+
 // Function to calculate alignment score (+ check scoring mode)
 long long calculateScore(const string& a, const string& b, bool isProtein) {
     if (a.length() != b.length()) {
@@ -69,8 +81,15 @@ long long calculateScore(const string& a, const string& b, bool isProtein) {
         char c1 = a[i];
         char c2 = b[i];
 
+        // Gap in either sequence
         if (c1 == '-' || c2 == '-') {
             score += GAP_SCORE;
+            continue;
+        }
+
+        // 'N' in either position, set score to 0 (ambiguous nucleotide)
+        if (!isProtein && (c1 == 'N' || c2 == 'N')) {
+            score += 0;
             continue;
         }
 
@@ -223,11 +242,15 @@ int main(int argc, char* argv[]) {
         AlignmentPair& est = estAligns[i];
         AlignmentPair& ref = refAligns[i];
 
+        // Strip gap-only columns (MSA artifact columns) before scoring
+        auto [refA, refB] = stripGapOnlyColumns(ref.seqA, ref.seqB);
+        auto [estA, estB] = stripGapOnlyColumns(est.seqA, est.seqB);
+
         // Two valid alignments of the same sequences may have different total
         // lengths (different gap placements), so truncating by column count
         // would compare different portions of the sequences
-        long long scoreEst = calculateScore(est.seqA, est.seqB, isProtein);
-        long long scoreRef = calculateScore(ref.seqA, ref.seqB, isProtein);
+        long long scoreEst = calculateScore(estA, estB, isProtein);  
+        long long scoreRef = calculateScore(refA, refB, isProtein);  
 
         long long diff = scoreRef - scoreEst;
 
