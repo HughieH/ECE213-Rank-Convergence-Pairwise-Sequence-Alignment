@@ -13,6 +13,15 @@
 //
 // TILE = 128 keeps shared memory at 3.9KB per block
 // nz (speculative start non-zero vector) = all +1 as required by paper 
+// 
+// Changes:
+//  1. Fixup block runs only when predecessor is converged and self not converged:
+//     (this avoids launching useful work on chunks that cannot converge yet)
+//
+//  2. Remove d_delta_new scratch (big global memory traffic) and compute deltas on-the-fly.
+//     Still updates delta_bnd[c] each iteration.
+//
+//  3. Add device flag d_any_work: if an iteration does no recompute at all, host breaks early.
 // ==========================================================================
 
 #include "alignment.cuh"
@@ -20,10 +29,11 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <vector>
 #include <tbb/parallel_for.h>
 
 // Tile dimension: each tile covers a TILE x TILE subregion of the M x N DP matrix
-#define TILE 128
+#define TILE 512
 // Number of RC chunks ("processors" run in parallel as mentioned in paper)
 #define P 4
 
@@ -368,6 +378,11 @@ __global__ void forwardPass(
 //
 // Grid:  numPairs * (P-1) blocks
 // Block: pair * (P-1) + (c-1)  ->  owns chunk c of a pair
+// 
+// UPDATES:
+// only runs if predecessor converged and self not converged
+// removes d_delta_new: compute delta on the fly
+// sets d_any_work=1 if any block did real recompute this iteration
 // ==========================================================================
 __global__ void fixupPhase(
     const int32_t* __restrict__ d_info,
@@ -378,9 +393,9 @@ __global__ void fixupPhase(
     int32_t bnd_cols, // width of each boundary row (= maxSeqLen + 1)
     int32_t* d_chunk_bnd, // per-chunk final output boundary [P * bnd_cols] per pair
     int32_t* d_delta_bnd, // delta of chunk_bnd [P * bnd_cols] per pair
-    int32_t* d_delta_new, // scratch space for the freshly computed delta
     uint8_t* d_conv_flags, // conv_flags[c]=1 means chunk c has converged and need not be rerun
-    int32_t num_chunks // number of RC chunks (= P)
+    int32_t num_chunks, // number of RC chunks (= P)
+    int32_t* d_any_work
 ) {
     const int32_t GAP = -2;
     int tx = threadIdx.x;
@@ -398,7 +413,12 @@ __global__ void fixupPhase(
     uint8_t* conv_flags = d_conv_flags + pair * num_chunks;
 
     // early exit: this chunk and its predecessor are both already converged
-    if (conv_flags[c] && conv_flags[c-1]) return;
+    if (conv_flags[c] || !conv_flags[c - 1]) return;
+
+    // mark that some work happens in this iteration
+    if (tx == 0) {
+        atomicExch(d_any_work, 1);
+    }
 
     int32_t M = d_seqLen[2 * pair];
     int32_t N = d_seqLen[2 * pair + 1];
@@ -418,14 +438,11 @@ __global__ void fixupPhase(
     int32_t* chunk_bnd = d_chunk_bnd + (int64_t)pair * num_chunks * bnd_cols;
     int32_t* delta_bnd = d_delta_bnd + (int64_t)pair * num_chunks * bnd_cols;
 
-    // per (pair, c) delta scratch — avoids write races since each block writes to its own slice
-    int32_t* delta_new = d_delta_new + ((int64_t)pair * (num_chunks-1) + (c-1)) * bnd_cols;
-
     int tr_start = c * chunk_size;
     int tr_end = min(tr_start + chunk_size, tile_rows);
 
     if (tr_start >= tile_rows) {
-        // chunk has no tile-rows (sequence shorter than expected) — mark converged
+                // chunk has no tile-rows (sequence shorter than expected) — mark converged
         if (tx == 0) {
             conv_flags[c] = 1;
         }
@@ -449,10 +466,10 @@ __global__ void fixupPhase(
     // chunk_bnd[c-1] is the corrected (or most-recently-updated) bottom of chunk c-1
     for (int j = tx; j <= N; j += bdx) {
         H_bnd[tr_start * bnd_cols + j] = chunk_bnd[(c-1) * bnd_cols + j];
-    }
+    }    
     __syncthreads();
 
-    // recompute all tile-rows in this chunk from the updated top boundary, same logic as forwardPass
+    // recompute this chunk
     for (int tr = tr_start; tr < tr_end; ++tr) {
         int row0 = tr * TILE;
         int tM = min(TILE, M - row0);
@@ -498,41 +515,35 @@ __global__ void fixupPhase(
     }
     __syncthreads();
 
-    // compute new delta for this iteration's output boundary
-    for (int j = tx; j <= N; j += bdx) {
-        delta_new[j] = (j == 0)
-            ? chunk_bnd[c * bnd_cols]
-            : chunk_bnd[c * bnd_cols + j] - chunk_bnd[c * bnd_cols + j - 1];
+    // compare delta(chunk_bnd[c]) vs delta_bnd[c] (previous)
+    if (tx == 0) {
+        *smem_conv = 1; // assume converged
     }
     __syncthreads();
 
-    // if (s is parallel to s[i]) -> delta vectors are identical
-    // only meaningful once predecessor has a stable, converged boundary to inject
-    if (conv_flags[c-1]) {
-        if (tx == 0) {
-            *smem_conv = 1; // assume converged
-        }
-        __syncthreads();
-
-        for (int j = tx; j <= N; j += bdx) {
-            if (delta_new[j] != delta_bnd[c * bnd_cols + j]) {
-                atomicAnd(smem_conv, 0); // any mismatch means not converged
-            }
-        }
-        __syncthreads();
-
-        if (*smem_conv) {
-            // deltas match, this chunk's output is now parallel to the correct boundary
-            if (tx == 0) {
-                conv_flags[c] = 1;
-            }
-        }
-        __syncthreads();
-    }
-
-    // paper line 24: s[i] = s — store updated delta as the new reference for next iteration
     for (int j = tx; j <= N; j += bdx) {
-        delta_bnd[c * bnd_cols + j] = delta_new[j];
+        int32_t cur = chunk_bnd[c * bnd_cols + j];
+        int32_t delta = (j == 0) ? cur : (cur - chunk_bnd[c * bnd_cols + (j - 1)]);
+        int32_t prev_delta = delta_bnd[c * bnd_cols + j];
+        if (delta != prev_delta) {
+            atomicAnd(smem_conv, 0); // any mismatch means not converged
+        }
+    }
+    __syncthreads();
+
+    if (*smem_conv) {
+        // deltas match, this chunk's output is now parallel to the correct boundary
+        if (tx == 0) {
+            conv_flags[c] = 1;
+        }
+    }
+    __syncthreads();
+
+    // update delta_bnd[c] for next iteration
+    for (int j = tx; j <= N; j += bdx) {
+        int32_t cur = chunk_bnd[c * bnd_cols + j];
+        int32_t delta = (j == 0) ? cur : (cur - chunk_bnd[c * bnd_cols + (j - 1)]);
+        delta_bnd[c * bnd_cols + j] = delta;
     }
 }
 
@@ -896,7 +907,7 @@ void GpuAligner::alignment() {
         fprintf(stderr, "GPU_ERROR (d_tile_dp): %s\n", cudaGetErrorString(err));
         exit(1);
     }
-
+    
     // 5. Allocate chunk_bnd: snapshot of each chunk's final output boundary row [P * bnd_cols] per pair
     size_t cb = (size_t)numPairs * P * bnd_cols * sizeof(int32_t);
     int32_t* d_chunk_bnd = nullptr;
@@ -924,22 +935,6 @@ void GpuAligner::alignment() {
         exit(1);
     }
 
-    // 7. Allocate delta_new: per-(pair, chunk) scratch for freshly computed delta [(P-1) * bnd_cols] per pair
-    // sized per chunk (not shared) to avoid write races between concurrent fixup blocks
-    size_t dn = (size_t)numPairs * (P-1) * bnd_cols * sizeof(int32_t);
-    int32_t* d_delta_new = nullptr;
-    // chk(cudaMalloc(&d_delta_new, dn), "delta_new");
-    // chk(cudaMemset(d_delta_new, 0, dn), "delta_new memset");
-    err = cudaMalloc(&d_delta_new, dn);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR (d_delta_new): %s\n", cudaGetErrorString(err));
-        exit(1);
-    }
-    err = cudaMemset(d_delta_new, 0, dn);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "GPU_ERROR (memset d_delta_new): %s\n", cudaGetErrorString(err));
-        exit(1);
-    }
 
     // 8. Allocate conv_flags: per-chunk convergence flags [P] per pair; 1 = converged, 0 = needs another fixup
     size_t cf = (size_t)numPairs * P * sizeof(uint8_t);
@@ -957,10 +952,18 @@ void GpuAligner::alignment() {
         exit(1);
     }
 
+    // any-work flag for fixup early break
+    int32_t* d_any_work = nullptr;
+    err = cudaMalloc(&d_any_work, sizeof(int32_t));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_any_work): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+
     // shared memory per block: ref+qry+pad + 5 boundary arrays + wf_scores + smem_conv
     size_t smem_bytes = (size_t)(2 * TILE + 8)
                       + (size_t)7 * (TILE + 1) * sizeof(int32_t)
-                      + sizeof(int32_t); 
+                      + sizeof(int32_t);
 
     // -----------------------------------------------------------------------
     // Phase 1: all numPairs*P chunks speculatively in parallel 
@@ -995,12 +998,14 @@ void GpuAligner::alignment() {
     // -----------------------------------------------------------------------
     std::vector<uint8_t> h_flags(numPairs * P);
     for (int iter = 0; iter < P - 1; ++iter) {
-        // all non-zero chunks of all pairs run simultaneously
+        int32_t zero = 0;
+        cudaMemcpy(d_any_work, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+
         fixupPhase<<<numPairs * (P-1), blockSize, smem_bytes>>>(
             d_info, d_seqLen, d_seqs,
             d_H_bnd, tile_rows_max, bnd_cols,
-            d_chunk_bnd, d_delta_bnd, d_delta_new,
-            d_conv_flags, P
+            d_chunk_bnd, d_delta_bnd,
+            d_conv_flags, P, d_any_work
         );
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -1011,8 +1016,14 @@ void GpuAligner::alignment() {
         if (err != cudaSuccess) {
             fprintf(stderr, "GPU_ERROR (fixupPhase sync): %s\n", cudaGetErrorString(err));
             exit(1);
-    }
+        }
 
+        // if no blocks did real work, break
+        int32_t h_any = 0;
+        cudaMemcpy(&h_any, d_any_work, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        if (h_any == 0) break;
+
+        // keep all converged break
         // check if all chunks of all pairs converged
         cudaMemcpy(h_flags.data(), d_conv_flags, cf, cudaMemcpyDeviceToHost);
         bool all_conv = true;
@@ -1028,7 +1039,7 @@ void GpuAligner::alignment() {
 
     // -----------------------------------------------------------------------
     // Phase 3: Traceback — one block per pair, sequential within each block
-    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------    
     tracebackPhase<<<numPairs, blockSize, smem_bytes>>>(
         d_info, d_seqLen, d_seqs, d_tb,
         d_H_bnd, tile_rows_max, bnd_cols,
@@ -1055,7 +1066,6 @@ void GpuAligner::alignment() {
     cudaFree(d_tile_dp);
     cudaFree(d_chunk_bnd);
     cudaFree(d_delta_bnd);
-    cudaFree(d_delta_new);
     cudaFree(d_conv_flags);
 }
 
