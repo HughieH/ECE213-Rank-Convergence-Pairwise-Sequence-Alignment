@@ -11,6 +11,10 @@ cmake ..
 make -j4
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PWD}/tbb_cmake_build/tbb_cmake_build_subdir_release
 
+DATASET="../data/sars_20000.fa"
+REF_ALN="../data/sars_20000.msa"
+OUTPUT="../data/sars_alignment.fa"
+
 # NOTE: Un-comment out the dataset you want to check! 
 # -----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -26,9 +30,9 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PWD}/tbb_cmake_build/tbb_cmake_build
 # ./compare_alignment --protein --reference ../data/reference_protein_alignment.fa --estimate ../data/protein_alignment.fa
 
 # -- sars_20000 dataset check --
-nsys profile -t cuda --stats=true ./aligner --sequence ../data/sars_20000.fa --maxPairs 200 --batchSize 200 -T 8 --output ../data/sars_alignment.fa
-./check_alignment --raw ../data/sars_20000.fa --alignment ../data/sars_alignment.fa
-./compare_alignment -v --reference ../data/sars_20000.msa --estimate ../data/sars_alignment.fa
+#nsys profile -t cuda --stats=true ./aligner --sequence ../data/sars_20000.fa --maxPairs 200 --batchSize 200 -T 8 --output ../data/sars_alignment.fa
+#./check_alignment --raw ../data/sars_20000.fa --alignment ../data/sars_alignment.fa
+#./compare_alignment -v --reference ../data/sars_20000.msa --estimate ../data/sars_alignment.fa
 
 # -----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -42,3 +46,16 @@ nsys profile -t cuda --stats=true ./aligner --sequence ../data/sars_20000.fa --m
 # compute-sanitizer ./aligner --sequence ../data/sequences.fa --maxPairs 5000 --batchSize 1500 -T 8 --output alignment_sanitizer.fa
 # ./check_alignment --raw ../data/sequences.fa --alignment alignment_sanitizer.fa
 # ./compare_alignment --reference ../data/reference_alignment.fa --estimate alignment_sanitizer.fa
+
+# --- Fixed total work, varying batch (shows batching effects) ---
+echo ""
+echo "------------------------------------------------"
+echo "Fixed  maxPairs=200, varying batchSize"
+echo "------------------------------------------------"
+for B in 10 25 50 100 200; do
+    echo ""
+    echo "--- maxPairs=200 batch=$B ---"
+    ./aligner --sequence $DATASET --maxPairs 200 --batchSize $B -T $T --output $OUTPUT
+done
+
+echo "Done!"
