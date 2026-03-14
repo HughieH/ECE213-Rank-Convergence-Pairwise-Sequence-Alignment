@@ -231,7 +231,9 @@ __global__ void forwardPass(
     int32_t bnd_cols, // width of each boundary row (= maxSeqLen + 1)
     int32_t* d_chunk_bnd, // snapshot of each chunk's final output boundary (per pair)
     int32_t* d_delta_bnd, // delta representation of chunk_bnd for convergence (per pair)
-    int32_t num_chunks // number of RC chunks (equal to P)
+    int32_t num_chunks, // number of RC chunks (equal to P)
+    int32_t* d_V_bnd, //vertical boundary storage
+    int32_t  tile_cols_max //max tile-cols for V_bnd indexing
 ) {
     const int32_t GAP = -2;
 
@@ -264,6 +266,10 @@ __global__ void forwardPass(
     // pointer to this pair's horizontal boundary submatrix in d_H_bnd
     int64_t hb_off = (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
     int32_t* H_bnd = d_H_bnd + hb_off;
+
+    // pointer to this pair's vertical boundary submatrix in d_V_bnd (for traceback phase)
+    int64_t vb_pair_offset = (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
+    int32_t* V_bnd = d_V_bnd + vb_pair_offset;
 
     // pointers into per-pair chunk boundary and delta arrays
     int32_t* chunk_bnd = d_chunk_bnd + (int64_t)pair * num_chunks * bnd_cols;
@@ -344,6 +350,11 @@ __global__ void forwardPass(
             for (int idx = tx; idx <= tN; idx += bdx) {
                 H_bnd[(tr+1) * bnd_cols + col0 + idx] = s_bot[idx];
             }
+
+            // store V_bnd for traceback
+            int64_t vb_tile = ((int64_t)tr * tile_cols_max + tc) * (TILE + 1);
+            for (int idx = tx; idx <= tM; idx += bdx)
+                V_bnd[vb_tile + idx] = s_right[idx];
             // carry s_right forward as s_left for the next tile-col
             for (int idx = tx; idx <= tM; idx += bdx) {
                 s_left[idx] = s_right[idx];
@@ -395,7 +406,9 @@ __global__ void fixupPhase(
     int32_t* d_delta_bnd, // delta of chunk_bnd [P * bnd_cols] per pair
     uint8_t* d_conv_flags, // conv_flags[c]=1 means chunk c has converged and need not be rerun
     int32_t num_chunks, // number of RC chunks (= P)
-    int32_t* d_any_work
+    int32_t* d_any_work,
+    int32_t* d_V_bnd,
+    int32_t tile_cols_max
 ) {
     const int32_t GAP = -2;
     int tx = threadIdx.x;
@@ -434,6 +447,9 @@ __global__ void fixupPhase(
 
     int64_t hb_off = (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
     int32_t* H_bnd = d_H_bnd + hb_off;
+
+    int64_t vb_off = (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
+    int32_t* V_bnd = d_V_bnd + vb_off;
 
     int32_t* chunk_bnd = d_chunk_bnd + (int64_t)pair * num_chunks * bnd_cols;
     int32_t* delta_bnd = d_delta_bnd + (int64_t)pair * num_chunks * bnd_cols;
@@ -502,6 +518,9 @@ __global__ void fixupPhase(
             for (int idx = tx; idx <= tN; idx += bdx) {
                 H_bnd[(tr+1) * bnd_cols + col0 + idx] = s_bot[idx];
             }
+            int64_t vb_tile = ((int64_t)tr * tile_cols_max + tc) * (TILE + 1);
+            for (int idx = tx; idx <= tM; idx += bdx)
+                V_bnd[vb_tile + idx] = s_right[idx];
             for (int idx = tx; idx <= tM; idx += bdx) {
                 s_left[idx] = s_right[idx];
             }
@@ -570,7 +589,9 @@ __global__ void tracebackPhase(
     const int32_t* __restrict__ d_H_bnd,
     int32_t tile_rows_max,
     int32_t bnd_cols,
-    int32_t* d_tile_dp // scratch space [(TILE+1)*(TILE+1)] per pair for the current tile's DP scores
+    int32_t* d_tile_dp, // scratch space [(TILE+1)*(TILE+1)] per pair for the current tile's DP scores
+    const int32_t* __restrict__ d_V_bnd,   // NEW: vertical boundary storage
+    int32_t tile_cols_max 
 ) {
     const int32_t GAP = -2;
     const uint8_t DIR_DIAG = 1, DIR_UP = 2, DIR_LEFT = 3;
@@ -596,6 +617,7 @@ __global__ void tracebackPhase(
 
     // pointers to this pair's data
     const int32_t* H_bnd = d_H_bnd + (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
+    const int32_t* V_bnd = d_V_bnd + (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
     int32_t* tile_dp = d_tile_dp + (int64_t)pair * DP_TILE_STRIDE * DP_TILE_STRIDE;
 
     // ---------------------------------------------------
@@ -655,100 +677,66 @@ __global__ void tracebackPhase(
         __syncthreads();
         if (shared_tr < 0) break;
 
-        // all threads cooperatively load the reference characters for this tile-row
+        // load the reference characters for this tile-row
         for (int i = tx; i < shared_tM; i += bdx) {
             shared_ref[i] = d_seqs[refStart + shared_row0 + i];
         }
 
-        // reconstruct s_left for the target tile-col by replaying tile-cols 0..tc-1.
-        // we cannot read V_bnd (it was never stored) so we recompute from H_bnd.
-        for (int i = tx; i <= shared_tM; i += bdx) {
-            s_left[i] = (int32_t)(shared_row0 + i) * GAP; // true NW left edge as starting point
-        }
-        __syncthreads();
-
-        for (int rtc = 0; rtc < shared_tc; rtc++) {
-            int rcol0 = rtc * TILE;
-            int rtN = min(TILE, N - rcol0);
-            for (int idx = tx; idx <= rtN; idx += bdx) {
-                s_top[idx] = H_bnd[shared_tr * bnd_cols + rcol0 + idx];
-            }
-            for (int j = tx; j < rtN; j += bdx) {
-                shared_qry[j] = d_seqs[qryStart + rcol0 + j];
-            }
-            __syncthreads();
-
-            // replay this tile to advance s_left -> s_right, then carry forward
-            computeTile(shared_tM, rtN, s_top, s_left, s_bot, s_right,
-                        wf_scores, shared_ref, shared_qry,
-                        nullptr, DP_TILE_STRIDE, isProtein, tx, bdx);
-
-            for (int i = tx; i <= shared_tM; i += bdx) {
-                s_left[i] = s_right[i];
-            }
-            __syncthreads();
+        // ============================================================
+        // NEW: V_bnd lookup replaces the O(tc * TILE^2) replay loop.
+        // Left boundary = right boundary of tile (tr, tc-1).
+        // For tc==0: NW base case.
+        // ============================================================
+        if (shared_tc == 0) {
+            for (int i = tx; i <= shared_tM; i += bdx)
+                s_left[i] = (int32_t)(shared_row0 + i) * GAP;
+        } else {
+            int64_t vb_left = ((int64_t)shared_tr * tile_cols_max + (shared_tc - 1)) * (TILE + 1);
+            for (int i = tx; i <= shared_tM; i += bdx)
+                s_left[i] = V_bnd[vb_left + i];
         }
 
-        // load the actual traceback tile's top and query, then compute with tile_dp
-        for (int j = tx; j <= shared_tN; j += bdx) {
+        // Load top boundary and query chars for this tile
+        for (int j = tx; j <= shared_tN; j += bdx)
             s_top[j] = H_bnd[shared_tr * bnd_cols + shared_col0 + j];
-        }
-        for (int j = tx; j < shared_tN; j += bdx) {
+        for (int j = tx; j < shared_tN; j += bdx)
             shared_qry[j] = d_seqs[qryStart + shared_col0 + j];
-        }
         __syncthreads();
 
-        // recompute with tile_dp to capture full DP scores for direction recovery
+        // Recompute tile DP with tile_dp storage for direction recovery
         computeTile(shared_tM, shared_tN, s_top, s_left, s_bot, s_right,
                     wf_scores, shared_ref, shared_qry,
                     tile_dp, DP_TILE_STRIDE, isProtein, tx, bdx);
 
-        // tx==0 walks the traceback within this tile until it exits a boundary
+        // Thread 0 walks the traceback within this tile
         if (tx == 0) {
             while (shared_li >= 1 && shared_lj >= 1 && shared_tbLen < tb_stride - 1) {
                 char r = shared_ref[shared_li - 1];
                 char q = shared_qry[shared_lj - 1];
-                // recover direction by re-evaluating the three NW recurrence cases
                 int32_t sd = tile_dp[(shared_li-1)*DP_TILE_STRIDE+(shared_lj-1)] + subScore(r, q, isProtein);
                 int32_t su = tile_dp[(shared_li-1)*DP_TILE_STRIDE+(shared_lj  )] + GAP;
                 int32_t sl = tile_dp[(shared_li  )*DP_TILE_STRIDE+(shared_lj-1)] + GAP;
                 uint8_t dir = DIR_DIAG;
                 int32_t best = sd;
-                if (su > best) {
-                    best = su;
-                    dir = DIR_UP;
-                }
-                if (sl > best) {
-                    dir = DIR_LEFT;
-                }
+                if (su > best) { best = su; dir = DIR_UP; }
+                if (sl > best) { dir = DIR_LEFT; }
                 d_tb[tbGlobalOffset + shared_tbLen++] = dir;
-                if (dir == DIR_DIAG) {
-                    shared_gi--;
-                    shared_gj--;
-                    shared_li--;
-                    shared_lj--;
-                } else if (dir == DIR_UP) {
-                    shared_gi--;
-                    shared_li--;
-                } else {
-                    shared_gj--;
-                    shared_lj--;
-                }
+                if (dir == DIR_DIAG) { shared_gi--; shared_gj--; shared_li--; shared_lj--; }
+                else if (dir == DIR_UP) { shared_gi--; shared_li--; }
+                else { shared_gj--; shared_lj--; }
             }
         }
         __syncthreads();
     }
 
-    // reverse tb for this pair
     if (tx == 0) {
-        // reverse in-place
         int len = shared_tbLen;
         for (int lo = 0, hi = len-1; lo < hi; lo++, hi--) {
             uint8_t tmp = d_tb[tbGlobalOffset + lo];
             d_tb[tbGlobalOffset + lo] = d_tb[tbGlobalOffset + hi];
             d_tb[tbGlobalOffset + hi] = tmp;
         }
-        d_tb[tbGlobalOffset + len] = 0; 
+        d_tb[tbGlobalOffset + len] = 0;
     }
 }
 
@@ -883,6 +871,7 @@ void GpuAligner::alignment() {
     if (isProtein) initProteinTablesOnce();
 
     int32_t tile_rows_max = (longestLen + TILE - 1) / TILE;
+    int32_t tile_cols_max = (longestLen + TILE - 1) / TILE;
     int32_t bnd_cols = longestLen + 1;
 
     // 3. H_bnd: full horizontal boundary matrix — zeroed so speculative chunks read 0 as their top
@@ -898,6 +887,12 @@ void GpuAligner::alignment() {
         fprintf(stderr, "GPU_ERROR (memset d_H_bnd): %s\n", cudaGetErrorString(err));
         exit(1);
     }
+
+    size_t vb = (size_t)numPairs * tile_rows_max * tile_cols_max * (TILE + 1) * sizeof(int32_t);
+    int32_t* d_V_bnd = nullptr;
+    err = cudaMalloc(&d_V_bnd, vb);
+    if (err != cudaSuccess) { fprintf(stderr, "GPU_ERROR (d_V_bnd): %s\n", cudaGetErrorString(err)); exit(1); }
+    cudaMemset(d_V_bnd, 0, vb);
 
     // 4. Allocate tile_dp: buffer for traceback within a tile for a pair
     size_t td = (size_t)numPairs * (TILE+1) * (TILE+1) * sizeof(int32_t);
@@ -971,7 +966,8 @@ void GpuAligner::alignment() {
     forwardPass<<<numPairs * P, blockSize, smem_bytes>>>(
         d_info, d_seqLen, d_seqs,
         d_H_bnd, tile_rows_max, bnd_cols,
-        d_chunk_bnd, d_delta_bnd, P
+        d_chunk_bnd, d_delta_bnd, P,
+        d_V_bnd, tile_cols_max
     );
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1005,7 +1001,8 @@ void GpuAligner::alignment() {
             d_info, d_seqLen, d_seqs,
             d_H_bnd, tile_rows_max, bnd_cols,
             d_chunk_bnd, d_delta_bnd,
-            d_conv_flags, P, d_any_work
+            d_conv_flags, P, d_any_work,
+            d_V_bnd, tile_cols_max
         );
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -1043,7 +1040,8 @@ void GpuAligner::alignment() {
     tracebackPhase<<<numPairs, blockSize, smem_bytes>>>(
         d_info, d_seqLen, d_seqs, d_tb,
         d_H_bnd, tile_rows_max, bnd_cols,
-        d_tile_dp
+        d_tile_dp,
+        d_V_bnd, tile_cols_max
     );
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR (tracebackPhase launch): %s\n", cudaGetErrorString(err));
@@ -1063,6 +1061,7 @@ void GpuAligner::alignment() {
 
     // Free mem
     cudaFree(d_H_bnd);
+    cudaFree(d_V_bnd);
     cudaFree(d_tile_dp);
     cudaFree(d_chunk_bnd);
     cudaFree(d_delta_bnd);

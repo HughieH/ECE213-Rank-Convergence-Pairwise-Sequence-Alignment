@@ -55,7 +55,7 @@ echo "------------------------------------------------"
 for B in 10 25 50 100 200; do
     echo ""
     echo "--- maxPairs=200 batch=$B ---"
-    ./aligner --sequence $DATASET --maxPairs 200 --batchSize $B -T $T --output $OUTPUT
+    ./aligner --sequence $DATASET --maxPairs 200 --batchSize $B -T 8 --output $OUTPUT
 done
 
 echo "Done!"
