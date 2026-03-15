@@ -3,12 +3,14 @@
 // Tiled NW with Rank Convergence (3-kernel approach)
 //
 // RC kernels:
-//     forwardPass -> Parallel Forward Pass kernel: 
+//     forwardPass -> Parallel Forward Pass kernel
 //                    numPairs * P blocks,
 //                    block = pair * P + c owns chunk c
-//     fixupPhase -> Fix-up kernel: 
+//     fixupPhase -> Fix-up kernel
 //                   numPairs * (P-1) blocks, iterates <= P-1 times
-//     tracebackPhase -> Traceback kernel: 
+//     finalizeVBnd -> Finalize V_bnd, ensure constant memory left-boundary 
+//                     lookups for tracebackPhase
+//     tracebackPhase -> Traceback kernel
 //                       numPairs blocks (similar to baseline)
 //
 // TILE = 128 keeps shared memory at 3.9KB per block
@@ -228,6 +230,8 @@ __global__ void forwardPass(
     const char* __restrict__ d_seqs, // device array of packed sequences
     int32_t* d_H_bnd, // horizontal boundary matrix
     int32_t tile_rows_max, // max number of tile-rows across all pairs
+    int32_t* d_V_bnd,      // vertical boundary matrix
+    int32_t tile_cols_max, 
     int32_t bnd_cols, // width of each boundary row (= maxSeqLen + 1)
     int32_t* d_chunk_bnd, // snapshot of each chunk's final output boundary (per pair)
     int32_t* d_delta_bnd, // delta representation of chunk_bnd for convergence (per pair)
@@ -348,6 +352,15 @@ __global__ void forwardPass(
             for (int idx = tx; idx <= tM; idx += bdx) {
                 s_left[idx] = s_right[idx];
             }
+
+            if (c == 0) {
+                int64_t vb_off  = (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
+                int64_t vb_base = ((int64_t)tr * tile_cols_max + tc) * (TILE + 1);
+                for (int idx = tx; idx <= tM; idx += bdx) {
+                    d_V_bnd[vb_off + vb_base + idx] = s_right[idx];
+                }
+            }
+
             __syncthreads();
         }
     }
@@ -390,6 +403,8 @@ __global__ void fixupPhase(
     const char* __restrict__ d_seqs,
     int32_t* d_H_bnd,
     int32_t tile_rows_max,
+    int32_t* d_V_bnd,      
+    int32_t tile_cols_max, 
     int32_t bnd_cols, // width of each boundary row (= maxSeqLen + 1)
     int32_t* d_chunk_bnd, // per-chunk final output boundary [P * bnd_cols] per pair
     int32_t* d_delta_bnd, // delta of chunk_bnd [P * bnd_cols] per pair
@@ -505,6 +520,14 @@ __global__ void fixupPhase(
             for (int idx = tx; idx <= tM; idx += bdx) {
                 s_left[idx] = s_right[idx];
             }
+
+            // overwrite V_bnd with corrected right boundary
+            int64_t vb_off  = (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
+            int64_t vb_base = ((int64_t)tr * tile_cols_max + tc) * (TILE + 1);
+            for (int idx = tx; idx <= tM; idx += bdx) {
+                d_V_bnd[vb_off + vb_base + idx] = s_right[idx];
+            }
+
             __syncthreads();
         }
     }
@@ -548,6 +571,132 @@ __global__ void fixupPhase(
 }
 
 // ==========================================================================
+// PHASE 2.5: finalizeVBnd
+//
+// Runs ONCE after the fixup loop, before tracebackPhase.
+// For any chunk c that never converged (conv_flags[c] == 0), it never ran
+// in fixupPhase — meaning V_bnd for its tile-rows was never written.
+// This kernel does one final sweep for those chunks to populate V_bnd
+// so tracebackPhase can do O(1) left-boundary lookups for all tile-rows.
+// ==========================================================================
+__global__ void finalizeVBnd(
+    const int32_t* __restrict__ d_info,
+    const int32_t* __restrict__ d_seqLen,
+    const char*    __restrict__ d_seqs,
+    const int32_t* __restrict__ d_H_bnd,
+    int32_t  tile_rows_max,
+    int32_t* d_V_bnd,
+    int32_t  tile_cols_max,
+    int32_t  bnd_cols,
+    const int32_t* __restrict__ d_chunk_bnd, // predecessor's converged boundary
+    const uint8_t* __restrict__ d_conv_flags,
+    int32_t  num_chunks
+) {
+    const int32_t GAP = -2;
+    int tx = threadIdx.x;
+    int bdx = blockDim.x;
+
+    int32_t numPairs = d_info[0];
+    int32_t maxSeqLen = d_info[1];
+    int32_t isProtein = d_info[2];
+
+    int pair = blockIdx.x / num_chunks;
+    int c = blockIdx.x % num_chunks;
+    if (pair >= numPairs) return;
+
+    // Skip chunk 0 or any chunk that has converged
+    if (c == 0 || d_conv_flags[pair * num_chunks + c]) return;
+
+    int32_t M = d_seqLen[2 * pair];
+    int32_t N = d_seqLen[2 * pair + 1];
+
+    int32_t refStart = (int64_t)(pair * 2) * maxSeqLen;
+    int32_t qryStart = (int64_t)(pair * 2 + 1) * maxSeqLen;
+
+    int32_t tile_rows = (M + TILE - 1) / TILE;
+    int32_t tile_cols = (N + TILE - 1) / TILE;
+
+    int DP_TILE_STRIDE = TILE + 1;
+    int chunk_size = (tile_rows + num_chunks - 1) / num_chunks;
+
+    int64_t hb_off = (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
+    
+    const int32_t* H_bnd = d_H_bnd + hb_off;
+    int32_t* V_bnd = d_V_bnd + (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
+
+    int tr_start = c * chunk_size;
+    int tr_end   = min(tr_start + chunk_size, tile_rows);
+    if (tr_start >= tile_rows) return;
+
+    // Read predecessor's converged bottom boundary as the top of our first tile-row.
+    int32_t* H_bnd_rw = const_cast<int32_t*>(H_bnd);
+    const int32_t* chunk_bnd = d_chunk_bnd + (int64_t)pair * num_chunks * bnd_cols;
+    for (int j = tx; j <= N; j += bdx) {
+        H_bnd_rw[tr_start * bnd_cols + j] = chunk_bnd[(c - 1) * bnd_cols + j];
+    }
+    __syncthreads();
+
+    // ---------------------------------------------------
+    // Shared memory pointers, used in computeTile
+    // ---------------------------------------------------
+    extern __shared__ char smem[];
+    char* shared_ref = smem;
+    char* shared_qry = shared_ref + TILE;
+    int32_t* s_top = (int32_t*)(shared_qry + TILE + 8);
+    int32_t* s_left = s_top + (TILE + 1);
+    int32_t* s_bot = s_left + (TILE + 1);
+    int32_t* s_right = s_bot + (TILE + 1);
+    int32_t* wf_scores = s_right + (TILE + 1);
+
+    // Same code as used throughout other kernels, recompute chunk
+    for (int tr = tr_start; tr < tr_end; ++tr) {
+        int row0 = tr * TILE;
+        int tM = min(TILE, M - row0);
+
+        for (int tc = 0; tc < tile_cols; ++tc) {
+            int col0 = tc * TILE;
+            int tN = min(TILE, N - col0);
+
+            for (int i = tx; i < tM; i += bdx) {
+                shared_ref[i] = d_seqs[refStart + row0 + i];
+            }
+            for (int j = tx; j < tN; j += bdx) {
+                shared_qry[j] = d_seqs[qryStart + col0 + j];
+            }
+            for (int idx = tx; idx <= tN; idx += bdx) {
+                s_top[idx] = H_bnd[tr * bnd_cols + col0 + idx];
+            }
+            // left column is always the true NW global left edge: s[i,0] = i * GAP
+            if (tc == 0) {
+                for (int idx = tx; idx <= tM; idx += bdx) {
+                    s_left[idx] = (int32_t)(row0 + idx) * GAP;
+                }
+            }
+            __syncthreads();
+
+            computeTile(tM, tN, s_top, s_left, s_bot, s_right,
+                        wf_scores, shared_ref, shared_qry,
+                        nullptr, DP_TILE_STRIDE, isProtein, tx, bdx);
+
+            // Write H_bnd bottom for the next tile-row's s_top
+            for (int idx = tx; idx <= tN; idx += bdx)
+                H_bnd_rw[(tr + 1) * bnd_cols + col0 + idx] = s_bot[idx];
+
+            for (int idx = tx; idx <= tM; idx += bdx)
+                s_left[idx] = s_right[idx];
+
+            // !! Write V_bnd !! main purpose of kernel
+            int64_t vb_base = ((int64_t)tr * tile_cols_max + tc) * (TILE + 1);
+            for (int idx = tx; idx <= tM; idx += bdx)
+                V_bnd[vb_base + idx] = s_right[idx];
+
+            __syncthreads();
+        }
+    }
+}
+
+
+// ==========================================================================
 // PHASE 3: tracebackPhase — Reconstruct alignment from converged DP boundaries
 //
 // Near identical to baseline implementation
@@ -569,6 +718,8 @@ __global__ void tracebackPhase(
     uint8_t* d_tb, // output traceback path array [(maxSeqLen*2+2)] per pair
     const int32_t* __restrict__ d_H_bnd,
     int32_t tile_rows_max,
+    const int32_t* __restrict__ d_V_bnd,  
+    int32_t tile_cols_max,                 
     int32_t bnd_cols,
     int32_t* d_tile_dp // scratch space [(TILE+1)*(TILE+1)] per pair for the current tile's DP scores
 ) {
@@ -596,6 +747,7 @@ __global__ void tracebackPhase(
 
     // pointers to this pair's data
     const int32_t* H_bnd = d_H_bnd + (int64_t)pair * (tile_rows_max + 1) * bnd_cols;
+    const int32_t* V_bnd = d_V_bnd + (int64_t)pair * tile_rows_max * tile_cols_max * (TILE + 1);
     int32_t* tile_dp = d_tile_dp + (int64_t)pair * DP_TILE_STRIDE * DP_TILE_STRIDE;
 
     // ---------------------------------------------------
@@ -660,34 +812,18 @@ __global__ void tracebackPhase(
             shared_ref[i] = d_seqs[refStart + shared_row0 + i];
         }
 
-        // reconstruct s_left for the target tile-col by replaying tile-cols 0..tc-1.
-        // we cannot read V_bnd (it was never stored) so we recompute from H_bnd.
-        for (int i = tx; i <= shared_tM; i += bdx) {
-            s_left[i] = (int32_t)(shared_row0 + i) * GAP; // true NW left edge as starting point
+        // O(1) V_bnd read:
+        if (shared_tc == 0) {
+            for (int i = tx; i <= shared_tM; i += bdx) {
+                s_left[i] = (int32_t)(shared_row0 + i) * GAP;
+            }
+        } else {
+            int64_t vb_base = ((int64_t)shared_tr * tile_cols_max + (shared_tc - 1)) * (TILE + 1);
+            for (int i = tx; i <= shared_tM; i += bdx) {
+                s_left[i] = V_bnd[vb_base + i];
+            }
         }
         __syncthreads();
-
-        for (int rtc = 0; rtc < shared_tc; rtc++) {
-            int rcol0 = rtc * TILE;
-            int rtN = min(TILE, N - rcol0);
-            for (int idx = tx; idx <= rtN; idx += bdx) {
-                s_top[idx] = H_bnd[shared_tr * bnd_cols + rcol0 + idx];
-            }
-            for (int j = tx; j < rtN; j += bdx) {
-                shared_qry[j] = d_seqs[qryStart + rcol0 + j];
-            }
-            __syncthreads();
-
-            // replay this tile to advance s_left -> s_right, then carry forward
-            computeTile(shared_tM, rtN, s_top, s_left, s_bot, s_right,
-                        wf_scores, shared_ref, shared_qry,
-                        nullptr, DP_TILE_STRIDE, isProtein, tx, bdx);
-
-            for (int i = tx; i <= shared_tM; i += bdx) {
-                s_left[i] = s_right[i];
-            }
-            __syncthreads();
-        }
 
         // load the actual traceback tile's top and query, then compute with tile_dp
         for (int j = tx; j <= shared_tN; j += bdx) {
@@ -709,9 +845,9 @@ __global__ void tracebackPhase(
                 char r = shared_ref[shared_li - 1];
                 char q = shared_qry[shared_lj - 1];
                 // recover direction by re-evaluating the three NW recurrence cases
-                int32_t sd = tile_dp[(shared_li-1)*DP_TILE_STRIDE+(shared_lj-1)] + subScore(r, q, isProtein);
-                int32_t su = tile_dp[(shared_li-1)*DP_TILE_STRIDE+(shared_lj  )] + GAP;
-                int32_t sl = tile_dp[(shared_li  )*DP_TILE_STRIDE+(shared_lj-1)] + GAP;
+                int32_t sd = tile_dp[(shared_li - 1)*DP_TILE_STRIDE+(shared_lj-1)] + subScore(r, q, isProtein);
+                int32_t su = tile_dp[(shared_li - 1)*DP_TILE_STRIDE+(shared_lj)] + GAP;
+                int32_t sl = tile_dp[(shared_li)*DP_TILE_STRIDE+(shared_lj-1)] + GAP;
                 uint8_t dir = DIR_DIAG;
                 int32_t best = sd;
                 if (su > best) {
@@ -885,7 +1021,7 @@ void GpuAligner::alignment() {
     int32_t tile_rows_max = (longestLen + TILE - 1) / TILE;
     int32_t bnd_cols = longestLen + 1;
 
-    // 3. H_bnd: full horizontal boundary matrix — zeroed so speculative chunks read 0 as their top
+    // 3.1. H_bnd: full horizontal boundary matrix — zeroed so speculative chunks read 0 as their top
     size_t hb = (size_t)numPairs * (tile_rows_max + 1) * bnd_cols * sizeof(int32_t);
     int32_t* d_H_bnd = nullptr;
     cudaError_t err = cudaMalloc(&d_H_bnd, hb);
@@ -894,6 +1030,21 @@ void GpuAligner::alignment() {
         exit(1);
     }
     err = cudaMemset(d_H_bnd, 0, hb);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (memset d_H_bnd): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+
+    // 3.2. V_bnd: right boundary of every tile [pair][tr * tile_cols_max + tc][TILE+1]
+    int32_t tile_cols_max = (longestLen + TILE - 1) / TILE;
+    size_t vb = (size_t)numPairs * tile_rows_max * tile_cols_max * (TILE + 1) * sizeof(int32_t);
+    int32_t* d_V_bnd = nullptr;
+    err = cudaMalloc(&d_V_bnd, vb);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "GPU_ERROR (d_V_bnd): %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    err = cudaMemset(d_V_bnd, 0, vb);
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR (memset d_H_bnd): %s\n", cudaGetErrorString(err));
         exit(1);
@@ -970,8 +1121,8 @@ void GpuAligner::alignment() {
     // -----------------------------------------------------------------------
     forwardPass<<<numPairs * P, blockSize, smem_bytes>>>(
         d_info, d_seqLen, d_seqs,
-        d_H_bnd, tile_rows_max, bnd_cols,
-        d_chunk_bnd, d_delta_bnd, P
+        d_H_bnd, tile_rows_max, d_V_bnd, tile_cols_max,
+        bnd_cols, d_chunk_bnd, d_delta_bnd, P
     );
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -994,17 +1145,17 @@ void GpuAligner::alignment() {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2: RC fix-up — at most P-1 kernel launches 
+    // Phase 2: RC fix-up — at most P-1 kernel launches
     // -----------------------------------------------------------------------
-    std::vector<uint8_t> h_flags(numPairs * P);
-    for (int iter = 0; iter < P - 1; ++iter) {
+    bool last_iter_did_work = false;
+    for (int iter = 0; iter < (P - 1); ++iter) {
         int32_t zero = 0;
         cudaMemcpy(d_any_work, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
 
         fixupPhase<<<numPairs * (P-1), blockSize, smem_bytes>>>(
             d_info, d_seqLen, d_seqs,
-            d_H_bnd, tile_rows_max, bnd_cols,
-            d_chunk_bnd, d_delta_bnd,
+            d_H_bnd, tile_rows_max, d_V_bnd, tile_cols_max,
+            bnd_cols, d_chunk_bnd, d_delta_bnd,
             d_conv_flags, P, d_any_work
         );
         err = cudaGetLastError();
@@ -1018,23 +1169,31 @@ void GpuAligner::alignment() {
             exit(1);
         }
 
-        // if no blocks did real work, break
         int32_t h_any = 0;
         cudaMemcpy(&h_any, d_any_work, sizeof(int32_t), cudaMemcpyDeviceToHost);
-        if (h_any == 0) break;
+        last_iter_did_work = (h_any != 0);
+        if (!last_iter_did_work) break; // nothing ran meaning all converged, exit early
+    }
 
-        // keep all converged break
-        // check if all chunks of all pairs converged
-        cudaMemcpy(h_flags.data(), d_conv_flags, cf, cudaMemcpyDeviceToHost);
-        bool all_conv = true;
-        for (int p = 0; p < numPairs && all_conv; p++) {
-            for (int c = 0; c < P && all_conv; c++) {
-                if (!h_flags[p * P + c]) {
-                    all_conv = false;
-                }
-            }
+    // -----------------------------------------------------------------------
+    // Phase 2.5: finalizeVBnd — populate V_bnd for any chunks that never ran
+    // -----------------------------------------------------------------------
+    if (last_iter_did_work) {
+        finalizeVBnd<<<numPairs * P, blockSize, smem_bytes>>>(
+            d_info, d_seqLen, d_seqs,
+            d_H_bnd, tile_rows_max, d_V_bnd, tile_cols_max,
+            bnd_cols, d_chunk_bnd, d_conv_flags, P
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "GPU_ERROR (finalizeVBnd launch): %s\n", cudaGetErrorString(err));
+            exit(1);
         }
-        if (all_conv) break; // early exit — best case is just 1 fix-up iteration
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "GPU_ERROR (finalizeVBnd sync): %s\n", cudaGetErrorString(err));
+            exit(1);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1042,8 +1201,8 @@ void GpuAligner::alignment() {
     // -----------------------------------------------------------------------    
     tracebackPhase<<<numPairs, blockSize, smem_bytes>>>(
         d_info, d_seqLen, d_seqs, d_tb,
-        d_H_bnd, tile_rows_max, bnd_cols,
-        d_tile_dp
+        d_H_bnd, tile_rows_max, d_V_bnd, tile_cols_max,
+        bnd_cols, d_tile_dp
     );
     if (err != cudaSuccess) {
         fprintf(stderr, "GPU_ERROR (tracebackPhase launch): %s\n", cudaGetErrorString(err));
@@ -1063,10 +1222,12 @@ void GpuAligner::alignment() {
 
     // Free mem
     cudaFree(d_H_bnd);
+    cudaFree(d_V_bnd); 
     cudaFree(d_tile_dp);
     cudaFree(d_chunk_bnd);
     cudaFree(d_delta_bnd);
     cudaFree(d_conv_flags);
+    cudaFree(d_any_work);
 }
 
 
