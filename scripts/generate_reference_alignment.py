@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 generate_reference_alignment.py
 
@@ -11,7 +10,6 @@ Usage:
     python generate_reference_alignment.py -i input.faa -o output.faa
 
 Example usage w/ our WOL2 protein dataset:
-
     python generate_reference_alignment.py -i ./data/subset_wol2_protein_10000.faa -o ./data/reference_protein_alignment.fa
 
 NOTE: Run `pip install Bio` before running script, its a key dependancy for the script.
@@ -30,11 +28,13 @@ def get_aligned_strings(alignment):
     # Concatenate just the sequence lines (every 3rd line starting at 0 and 2)
     seq1_parts = []
     seq2_parts = []
+
     for i in range(0, len(lines), 3):
         if i < len(lines):
             seq1_parts.append(lines[i].split()[-1] if lines[i].split() else '')
         if i + 2 < len(lines):
             seq2_parts.append(lines[i + 2].split()[-1] if lines[i + 2].split() else '')
+
     return ''.join(seq1_parts), ''.join(seq2_parts)
 
 
@@ -42,8 +42,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input',  required=True, help='Input .faa file')
     parser.add_argument('-o', '--output', required=True, help='Output aligned FASTA file')
-    parser.add_argument('--gap', type=float, default=-2.0,
-                        help='Linear gap penalty (default: -2, matches our CUDA implementation)')
+    parser.add_argument('--gap', type=float, default=-2.0, help='Linear gap penalty (default: -2, matches our CUDA implementation scoring matrix)')
     args = parser.parse_args()
 
     # Configure aligner to match our scoring matrix
@@ -53,16 +52,16 @@ def main():
     aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
 
     # Linear gap penalty, default to -2
-    aligner.open_gap_score   = args.gap
+    aligner.open_gap_score = args.gap
     aligner.extend_gap_score = args.gap
-    aligner.target_left_open_gap_score    = args.gap
-    aligner.target_left_extend_gap_score  = args.gap
-    aligner.target_right_open_gap_score   = args.gap
+    aligner.target_left_open_gap_score = args.gap
+    aligner.target_left_extend_gap_score = args.gap
+    aligner.target_right_open_gap_score = args.gap
     aligner.target_right_extend_gap_score = args.gap
-    aligner.query_left_open_gap_score     = args.gap
-    aligner.query_left_extend_gap_score   = args.gap
-    aligner.query_right_open_gap_score    = args.gap
-    aligner.query_right_extend_gap_score  = args.gap                  
+    aligner.query_left_open_gap_score = args.gap
+    aligner.query_left_extend_gap_score = args.gap
+    aligner.query_right_open_gap_score = args.gap
+    aligner.query_right_extend_gap_score = args.gap                  
 
     records = list(SeqIO.parse(args.input, "fasta"))
 
@@ -75,6 +74,7 @@ def main():
             qry = records[i + 1]
 
             print(f"Aligning {ref.id} vs {qry.id} ...")
+
             alignments = aligner.align(str(ref.seq), str(qry.seq))
             best = alignments[0]
 

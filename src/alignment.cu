@@ -1,29 +1,16 @@
 
 // ==========================================================================
-// Tiled NW with Rank Convergence (3-kernel approach)
+// Tiled NW with Rank Convergence (4-kernel approach)
 //
 // RC kernels:
 //     forwardPass -> Parallel Forward Pass kernel
-//                    numPairs * P blocks,
-//                    block = pair * P + c owns chunk c
+//
 //     fixupPhase -> Fix-up kernel
-//                   numPairs * (P-1) blocks, iterates <= P-1 times
+//
 //     finalizeVBnd -> Finalize V_bnd, ensure constant memory left-boundary 
 //                     lookups for tracebackPhase
+//
 //     tracebackPhase -> Traceback kernel
-//                       numPairs blocks (similar to baseline)
-//
-// TILE = 128 keeps shared memory at 3.9KB per block
-// nz (speculative start non-zero vector) = all +1 as required by paper 
-// 
-// Changes:
-//  1. Fixup block runs only when predecessor is converged and self not converged:
-//     (this avoids launching useful work on chunks that cannot converge yet)
-//
-//  2. Remove d_delta_new scratch (big global memory traffic) and compute deltas on-the-fly.
-//     Still updates delta_bnd[c] each iteration.
-//
-//  3. Add device flag d_any_work: if an iteration does no recompute at all, host breaks early.
 // ==========================================================================
 
 #include "alignment.cuh"
@@ -119,7 +106,6 @@ __device__ void computeTile(
     const int32_t NEG_INF = -1000000; // value for uninitialized cells
     const int32_t GAP = -2;           // linear gap penalty
     const int WFS = TILE + 1;         // wavefront buffer width
-    // const uint8_t DIR_DIAG = 1, DIR_UP = 2, DIR_LEFT = 3;
 
     for (int idx = tx; idx < 3*WFS; idx += bdx) {
         wf_scores[idx] = NEG_INF;
@@ -142,10 +128,10 @@ __device__ void computeTile(
     }
     __syncthreads();
 
-    // process each anti-diagonal k = i + j in order (wavefront sweep)
+    // process each anti-diagonal k = i + j in order (our wavefront sweep, like in PA2)
     for (int k = 0; k <= tM + tN; ++k) {
-        int curr_k = (k % 3) * WFS;       // current diagonal's slot
-        int pre_k = ((k+2) % 3) * WFS;    // k-1 diagonal (UP/LEFT gap source)
+        int curr_k = (k % 3) * WFS; // current diagonal's slot
+        int pre_k = ((k+2) % 3) * WFS; // k-1 diagonal (UP/LEFT gap source)
         int prepre_k = ((k+1) % 3) * WFS; // k-2 diagonal (DIAG score source)
 
         for (int idx = tx; idx < WFS; idx += bdx) {
@@ -160,7 +146,6 @@ __device__ void computeTile(
         for (int i = i_start + tx; i <= i_end; i += bdx) {
             int j = k - i;
             int32_t score;
-            // uint8_t dir = DIR_DIAG;
 
             if (i == 0 && j == 0) {
                 // top-left corner: inherit from s_top[0] (= s_left[0] by NW base case)
@@ -201,7 +186,7 @@ __device__ void computeTile(
                 s_right[i] = score; // reached right edge, write to s_right
             }
             if (i == tM) {
-                s_bot[j] = score;   // reached bottom edge, write to s_bot
+                s_bot[j] = score; // reached bottom edge, write to s_bot
             }
             if (tile_dp) {
                 tile_dp[i * DP_TILE_STRIDE + j] = score;
@@ -297,14 +282,13 @@ __global__ void forwardPass(
         }
         __syncthreads();
     }
-    // chunks 1..P-1 read H_bnd[tr_start * bnd_cols + j] which is 0 (from cudaMemset).
-    // this is the speculative nz top boundary — incorrect but non-(-inf)
 
+    // chunks 1..P-1 read H_bnd[tr_start * bnd_cols + j] which is 0 (from cudaMemset).
     // sweep all tile-rows in this chunk, left to right across tile-cols
     for (int tr = tr_start; tr < tr_end; ++tr) {
        
-        int row0 = tr * TILE;           // first row index of this tile-row
-        int tM = min(TILE, M - row0);   // actual rows in this tile
+        int row0 = tr * TILE; // first row index of this tile-row
+        int tM = min(TILE, M - row0); // actual rows in this tile
 
         for (int tc = 0; tc < tile_cols; ++tc) {
             int col0 = tc * TILE;           // first col index of this tile-col
@@ -373,7 +357,6 @@ __global__ void forwardPass(
 
     // compute and store the delta representation of chunk_bnd[c]
     // delta[j] = chunk_bnd[j] - chunk_bnd[j-1] (difference of adjacent boundary values).
-    // two boundary vectors are "parallel" (rank-1 convergence) if their deltas are equal.
     for (int j = tx; j <= N; j += bdx) {
         delta_bnd[c * bnd_cols + j] = (j == 0)
             ? chunk_bnd[c * bnd_cols]
@@ -387,12 +370,11 @@ __global__ void forwardPass(
 // (do-while fix-up loop body, parallel.for p in 2..P).
 // All P-1 non-zero chunks of all pairs run simultaneously in each iteration.
 // The host calls this kernel at most P-1 times, stopping early if all converged.
-// Each cudaDeviceSynchronize between launches acts as the paper's barrier (line 25).
+// Each cudaDeviceSynchronize between launches acts as a barrier as mentioned in the paper.
 //
 // Grid:  numPairs * (P-1) blocks
 // Block: pair * (P-1) + (c-1)  ->  owns chunk c of a pair
 // 
-// UPDATES:
 // only runs if predecessor converged and self not converged
 // removes d_delta_new: compute delta on the fly
 // sets d_any_work=1 if any block did real recompute this iteration
@@ -457,7 +439,7 @@ __global__ void fixupPhase(
     int tr_end = min(tr_start + chunk_size, tile_rows);
 
     if (tr_start >= tile_rows) {
-                // chunk has no tile-rows (sequence shorter than expected) — mark converged
+        // chunk has no tile-rows (sequence shorter than expected) — mark converged
         if (tx == 0) {
             conv_flags[c] = 1;
         }
@@ -592,6 +574,7 @@ __global__ void finalizeVBnd(
     const uint8_t* __restrict__ d_conv_flags,
     int32_t  num_chunks
 ) {
+    // Similar setup to our other kernels
     const int32_t GAP = -2;
     int tx = threadIdx.x;
     int bdx = blockDim.x;
@@ -604,7 +587,6 @@ __global__ void finalizeVBnd(
     int c = blockIdx.x % num_chunks;
     if (pair >= numPairs) return;
 
-    // Skip chunk 0 or any chunk that has converged
     if (c == 0 || d_conv_flags[pair * num_chunks + c]) return;
 
     int32_t M = d_seqLen[2 * pair];
@@ -699,14 +681,7 @@ __global__ void finalizeVBnd(
 // ==========================================================================
 // PHASE 3: tracebackPhase — Reconstruct alignment from converged DP boundaries
 //
-// Near identical to baseline implementation
-//
-// For each tile on the path:
-//   1. Load boundaries: H_bnd for top, V_bnd for left
-//   2. Recompute full tile DP together (256 threads, wavefront),
-//      and stores scores in tile_dp[] in global memory
-//   3. Thread 0 walks within the tile using tile_dp scores to recover
-//      directions on the fly (so no need for direction storage)
+// Similar to baseline implementation, V_bnd computed and read in O(1) from d_V_bnd
 //
 // Grid:  numPairs blocks (one block per pair)
 // Block: blockIdx.x == pair index
@@ -763,12 +738,12 @@ __global__ void tracebackPhase(
     int32_t* wf_scores = s_right + (TILE + 1);
 
     // shared state for the single-threaded traceback pointer (only tx==0 advances it)
-    __shared__ int shared_gi, shared_gj;     // current global (row, col) in full DP matrix
-    __shared__ int shared_li, shared_lj;     // local (row, col) within the current tile
-    __shared__ int shared_tr, shared_tc;     // current tile indices
+    __shared__ int shared_gi, shared_gj; // current global (row, col) in full DP matrix
+    __shared__ int shared_li, shared_lj; // local (row, col) within the current tile
+    __shared__ int shared_tr, shared_tc; // current tile indices
     __shared__ int shared_row0, shared_col0; // tile origin in global coords
-    __shared__ int shared_tM, shared_tN;     // actual tile sizes
-    __shared__ int shared_tbLen;             // traceback path len so far
+    __shared__ int shared_tM, shared_tN; // actual tile sizes
+    __shared__ int shared_tbLen; // traceback path len so far
 
     if (tx == 0) {
         shared_gi = M;
@@ -1148,6 +1123,7 @@ void GpuAligner::alignment() {
     // Phase 2: RC fix-up — at most P-1 kernel launches
     // -----------------------------------------------------------------------
     bool last_iter_did_work = false;
+    
     for (int iter = 0; iter < (P - 1); ++iter) {
         int32_t zero = 0;
         cudaMemcpy(d_any_work, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
