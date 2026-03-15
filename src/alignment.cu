@@ -1,5 +1,5 @@
 // -----------------------------------------------------------
-// alignment.cu — Tiled Needleman-Wunsch (tentative) baseline
+// alignment.cu — Tiled Needleman-Wunsch baseline
 //
 // Architecture:
 //   Forward pass:  TILExTILE tiles, row-by-row, left-to-right.
