@@ -56,7 +56,7 @@ struct AlignmentPair {
     string name; // Optional, for reporting
 };
 
-// Strip columns where BOTH sequences have '-' (MSA-only artifact columns)
+// Strip columns where BOTH sequences have '-'
 pair<string, string> stripGapOnlyColumns(const string& a, const string& b) {
     string outA, outB;
     size_t len = min(a.size(), b.size());
